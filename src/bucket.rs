@@ -25,8 +25,7 @@ impl<K, V> Cell<K, V> {
 #[repr(C)]
 pub struct Bucket<K, V> {
     lock: Mutex,
-    signatures: [AtomicU8; 5],
-    cells: [Cell<K, V>; 5],
+    cells: [Cell<K, V>; 6],
     next: Atomic<Bucket<K, V>>,
 }
 
