@@ -1,13 +1,12 @@
-use crate::bucket::Bucket;
+use crate::bucket::{Bucket, BucketEntry};
 use crossbeam::epoch::*;
-use std::collections::hash_map::DefaultHasher;
-use std::fmt::{Error, Formatter, Write};
-use std::hash::{BuildHasherDefault, Hash, Hasher};
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::Ordering::*;
 use wyhash::WyHash;
 
 pub struct HashMap<K, V> {
     buckets: Atomic<Box<[Bucket<K, V>]>>,
+    cap_log2: u32,
 }
 
 impl<K, V> HashMap<K, V>
@@ -16,42 +15,48 @@ where
     V: 'static,
 {
     pub fn new() -> Self {
-        let buckets = Atomic::new(vec![Bucket::new(), Bucket::new()].into_boxed_slice());
-        Self { buckets }
+        Self::with_pow_buckets(2)
     }
 
-    pub fn with_num_buckets(num: usize) -> Self {
-        assert_eq!(num % 2, 0);
-        let buckets = (0..num).map(|_| Bucket::new()).collect::<Vec<_>>();
+    pub fn with_pow_buckets(pow: u32) -> Self {
+        assert!(pow > 0);
+        let cap = 2usize.pow(pow);
+        let buckets = (0..cap).map(|_| Bucket::new()).collect::<Vec<_>>();
         Self {
             buckets: Atomic::new(buckets.into_boxed_slice()),
+            cap_log2: pow,
         }
     }
 
     pub fn insert(&self, key: K, val: V, guard: &Guard) -> bool {
-        let mut hasher = WyHash::default();
-        key.hash(&mut hasher);
-        let hash = hasher.finish();
         unsafe {
             let buckets = self.buckets.load(SeqCst, guard).deref();
-            let mask = buckets.len() as u64 - 1;
-            let index = (hash & mask) as usize;
-            let bucket = buckets.get_unchecked(index);
-            bucket.insert(key, val, &guard)
+            let (bin, sign) = self.bin_and_signature(&key);
+            let bucket = buckets.get_unchecked(bin);
+            let entry = BucketEntry { key, val, sign };
+            bucket.insert(entry, &guard)
         }
     }
 
     pub fn get<'g>(&self, key: &K, guard: &'g Guard) -> Option<&'g V> {
+        unsafe {
+            let buckets = self.buckets.load(SeqCst, guard).deref();
+            let (bin, signature) = self.bin_and_signature(key);
+            let bucket = buckets.get_unchecked(bin);
+            bucket.find(key, signature, &guard)
+        }
+    }
+
+    #[inline(never)]
+    fn bin_and_signature(&self, key: &K) -> (usize, u8)
+    {
         let mut hasher = WyHash::default();
         key.hash(&mut hasher);
         let hash = hasher.finish();
-        unsafe {
-            let buckets = self.buckets.load(SeqCst, guard).deref();
-            let mask = buckets.len() as u64 - 1;
-            let index = (hash & mask) as usize;
-            let bucket = buckets.get_unchecked(index);
-            bucket.find(key, &guard)
-        }
+        let cap_log2 = self.cap_log2;
+        let index = hash >> (64 - cap_log2 as u64);
+        let sign = hash >> (64 - 8 - cap_log2 as u64) & ((1 << 8) - 1);
+        (index as usize, sign as u8)
     }
 }
 
@@ -64,19 +69,19 @@ impl<K, V> std::fmt::Debug for HashMap<K, V> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::cell::Cell;
     use std::sync::Arc;
     use std::thread;
-    use std::cell::Cell;
 
     #[test]
     fn test_simple_insert() {
-        let map = Arc::new(HashMap::new());
+        let map = Arc::new(HashMap::with_pow_buckets(8));
         let handles = (0..=2)
             .map(|v| {
                 let m = Arc::clone(&map);
                 thread::spawn(move || {
                     let g = pin();
-                    assert!(m.insert(v, v, &g));
+                    m.insert(v, v, &g);
                 })
             })
             .collect::<Vec<_>>();

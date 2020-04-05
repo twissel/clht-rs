@@ -8,7 +8,7 @@ use std::sync::Arc;
 const ITER: u64 = 32 * 1024;
 
 fn task_insert_u64_u64(threads: usize) -> HashMap<u64, u64> {
-    let map = Arc::new(HashMap::with_num_buckets((ITER / 8) as usize));
+    let map = Arc::new(HashMap::with_pow_buckets(13));
     let inc = ITER / (threads as u64);
 
     rayon::scope(|s| {
@@ -18,7 +18,7 @@ fn task_insert_u64_u64(threads: usize) -> HashMap<u64, u64> {
                 let start = t * inc;
                 let guard = epoch::pin();
                 for i in start..(start + inc) {
-                    m.insert(i, i + 7, &guard);
+                    assert!(m.insert(i, i + 7, &guard));
                 }
             });
         }
@@ -91,5 +91,5 @@ fn get_u64_u64(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, insert_clht_u64_u64, get_u64_u64);
+criterion_group!(benches, get_u64_u64);
 criterion_main!(benches);
