@@ -48,15 +48,24 @@ where
     }
 
     #[inline(never)]
-    fn bin_and_signature(&self, key: &K) -> (usize, u8)
-    {
-        let mut hasher = WyHash::default();
+    fn bin_and_signature(&self, key: &K) -> (usize, u8) {
+        let mut hasher = ahash::AHasher::default();
         key.hash(&mut hasher);
         let hash = hasher.finish();
         let cap_log2 = self.cap_log2;
         let index = hash >> (64 - cap_log2 as u64);
         let sign = hash >> (64 - 8 - cap_log2 as u64) & ((1 << 8) - 1);
         (index as usize, sign as u8)
+    }
+}
+
+impl<K, V> Drop for HashMap<K, V> {
+    fn drop(&mut self) {
+        unsafe {
+            // TODO: use Relaxed in all drops
+            let mut buckets = self.buckets.load(Acquire, unprotected());
+            let _ = buckets.into_owned();
+        }
     }
 }
 

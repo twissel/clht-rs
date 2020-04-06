@@ -8,12 +8,15 @@ crossbeam = "0.7.3"
 parking_lot = "0.10.0"
 wyhash = "0.3.0"
 bitvec = "0.17"
+ahash = ""
 
 [dev-dependencies]
 rand = "0.7"
 rayon = "1.3"
 criterion = "0.3"
 num_cpus = "1.12.0"
+mimalloc = { version = "0.1", default-features = false }
+jemallocator  = "0.3"
 
 [[bench]]
 name = "clht"

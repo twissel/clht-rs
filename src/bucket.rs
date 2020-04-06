@@ -164,7 +164,6 @@ where
         }
     }
 
-    #[inline(never)]
     pub fn find<'g>(&self, key: &K, signature: u8, guard: &'g Guard) -> Option<&'g V> {
         self.entries(guard).find_map(|entry| {
             let cell = entry.load_cell(guard);
@@ -185,6 +184,35 @@ where
                 None => None,
             }
         })
+    }
+}
+
+impl<K, V> Bucket<K, V> {
+    fn clean_cells(&mut self) {
+        unsafe {
+            for cell in &self.cells {
+                let pair = cell.load(Acquire, unprotected());
+                if let Some(pair_ref) = pair.as_ref() {
+                    let owned_pair = pair.into_owned();
+                    drop(owned_pair);
+                }
+            }
+        }
+    }
+}
+
+impl<K, V> Drop for Bucket<K, V> {
+    fn drop(&mut self) {
+        unsafe {
+            self.clean_cells();
+            let mut current = self.next.load(Acquire, unprotected());
+            while let Some(bucket) = current.as_ref() {
+                let next = bucket.next.load(Acquire, unprotected());
+                let mut owned_bucket = current.into_owned();
+                owned_bucket.clean_cells();
+                current = next;
+            }
+        }
     }
 }
 

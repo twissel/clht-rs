@@ -5,10 +5,16 @@ use rayon;
 use rayon::prelude::*;
 use std::sync::Arc;
 
+//#[global_allocator]
+//static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+//#[global_allocator]
+//static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 const ITER: u64 = 32 * 1024;
 
 fn task_insert_u64_u64(threads: usize) -> HashMap<u64, u64> {
-    let map = Arc::new(HashMap::with_pow_buckets(13));
+    let map = Arc::new(HashMap::with_pow_buckets(16));
     let inc = ITER / (threads as u64);
 
     rayon::scope(|s| {
@@ -27,7 +33,7 @@ fn task_insert_u64_u64(threads: usize) -> HashMap<u64, u64> {
     Arc::try_unwrap(map).unwrap()
 }
 
-fn insert_clht_u64_u64(c: &mut Criterion) {
+fn insert_u64_u64(c: &mut Criterion) {
     let mut group = c.benchmark_group("insert_clht_u64_u64");
     group.throughput(Throughput::Elements(ITER as u64));
     let max = num_cpus::get();
@@ -91,5 +97,5 @@ fn get_u64_u64(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, get_u64_u64);
+criterion_group!(benches, insert_u64_u64);
 criterion_main!(benches);
