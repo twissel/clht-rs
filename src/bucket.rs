@@ -193,8 +193,7 @@ impl<K, V> Bucket<K, V> {
             for cell in &self.cells {
                 let pair = cell.load(Acquire, unprotected());
                 if let Some(pair_ref) = pair.as_ref() {
-                    let owned_pair = pair.into_owned();
-                    drop(owned_pair);
+                    let _ = pair.into_owned();
                 }
             }
         }
