@@ -63,7 +63,7 @@ impl<K, V> Drop for HashMap<K, V> {
     fn drop(&mut self) {
         unsafe {
             // TODO: use Relaxed in all drops
-            let mut buckets = self.buckets.load(Acquire, unprotected());
+            let buckets = self.buckets.load(Acquire, unprotected());
             let _ = buckets.into_owned();
         }
     }

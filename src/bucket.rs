@@ -204,12 +204,9 @@ impl<K, V> Drop for Bucket<K, V> {
     fn drop(&mut self) {
         unsafe {
             self.clean_cells();
-            let mut current = self.next.load(Acquire, unprotected());
-            while let Some(bucket) = current.as_ref() {
-                let next = bucket.next.load(Acquire, unprotected());
-                let mut owned_bucket = current.into_owned();
-                owned_bucket.clean_cells();
-                current = next;
+            let next = self.next.load(Acquire, unprotected());
+            if let Some(_) = next.as_ref() {
+                let _ = next.into_owned();
             }
         }
     }
@@ -229,45 +226,61 @@ mod tests {
 
     #[test]
     fn test_insert_when_bucket_full_no_next() {
-        /*let bucket = Bucket::new();
+        let bucket = Bucket::new();
         let guard = pin();
         let pairs = (0..=6).map(|v| (v, v)).collect::<Vec<_>>();
         for pair in pairs.iter().copied() {
-            assert!(bucket.insert(pair.0, pair.1, &guard));
+            assert!(bucket.insert(
+                BucketEntry {
+                    key: pair.0,
+                    val: pair.1,
+                    sign: 0
+                },
+                &guard
+            ));
         }
 
         for pair in pairs.iter() {
-            assert_eq!(bucket.find(&pair.0, &guard), Some(&pair.1));
-        }*/
-        unimplemented!()
+            assert_eq!(bucket.find(&pair.0, 0, &guard), Some(&pair.1));
+        }
     }
 
     #[test]
     fn test_insert_when_bucket_full_nas_next() {
-        /*let bucket = Bucket::new();
+        let bucket = Bucket::new();
         let guard = pin();
         let pairs = (0..=7).map(|v| (v, v)).collect::<Vec<_>>();
         for pair in pairs.iter().copied() {
-            assert!(bucket.insert(pair.0, pair.1, &guard));
+            assert!(bucket.insert(
+                BucketEntry {
+                    key: pair.0,
+                    val: pair.1,
+                    sign: 0
+                },
+                &guard
+            ));
         }
 
         for pair in pairs.iter() {
-            assert_eq!(bucket.find(&pair.0, &guard), Some(&pair.1));
-        }*/
+            assert_eq!(bucket.find(&pair.0, 0, &guard), Some(&pair.1));
+        }
     }
 
     #[test]
     fn test_insert_when_overflow_bucket_was_full() {
-        /*let bucket = Bucket::new();
+        let bucket = Bucket::new();
         let guard = pin();
         let pairs = (0..=20).map(|v| (v, v)).collect::<Vec<_>>();
         for pair in pairs.iter().copied() {
-            assert!(bucket.insert(pair.0, pair.1, &guard));
+            assert!(bucket.insert(BucketEntry {
+                key: pair.0,
+                val: pair.1,
+                sign: 0
+            }, &guard));
         }
 
         for pair in pairs.iter() {
-            assert_eq!(bucket.find(&pair.0, &guard), Some(&pair.1));
-        }*/
-        unimplemented!()
+            assert_eq!(bucket.find(&pair.0, 0, &guard), Some(&pair.1));
+        }
     }
 }
