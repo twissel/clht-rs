@@ -1,4 +1,4 @@
-use crate::bucket::{Bucket, BucketEntry};
+use crate::bucket::{Bucket, BucketEntry, UpdateResult};
 use crossbeam::epoch::*;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::Ordering::*;
@@ -10,8 +10,8 @@ pub struct HashMap<K, V> {
 
 impl<K, V> HashMap<K, V>
 where
-    K: Eq + Hash + 'static,
-    V: 'static,
+    K: Eq + Hash + 'static + Send,
+    V: 'static + Send,
 {
     pub fn new() -> Self {
         Self::with_pow_buckets(2)
@@ -27,14 +27,19 @@ where
         }
     }
 
-    pub fn insert(&self, key: K, val: V, guard: &Guard) -> bool {
+    pub fn insert<'g>(&self, key: K, val: V, guard: &'g Guard) -> Option<&'g (K, V)> {
         unsafe {
             let buckets = self.buckets.load(SeqCst, guard).deref();
             let (bin, sign) = self.bin_and_signature(&key);
             let bucket = buckets.get_unchecked(bin);
             let entry = BucketEntry { key, val, sign };
             let w = bucket.write();
-            w.insert(entry, &guard)
+            let res = w.insert(entry, &guard);
+            match res {
+                UpdateResult::New => None,
+                UpdateResult::Overflow => None,
+                UpdateResult::Replaced(rep) => Some(rep)
+            }
         }
     }
 

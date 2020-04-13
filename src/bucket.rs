@@ -28,7 +28,6 @@ impl<'a, K, V> BucketEntryRef<'a, K, V> {
         self.cell.load(Acquire, guard)
     }
 
-    // TODO: use swap
     fn store(&self, entry: BucketEntry<K, V>) {
         self.signature.store(entry.sign, Release);
         self.cell.store(Owned::new((entry.key, entry.val)), Release);
@@ -149,7 +148,7 @@ where
         let guard = self.lock.lock();
         WriteGuard {
             _guard: guard,
-            bucket: self
+            bucket: self,
         }
     }
 }
@@ -181,14 +180,19 @@ impl<K, V> Drop for Bucket<K, V> {
 
 pub struct WriteGuard<'a, K, V> {
     _guard: MutexGuard<'a>,
-    bucket: &'a Bucket<K, V>
+    bucket: &'a Bucket<K, V>,
 }
 
 impl<'a, K, V> WriteGuard<'a, K, V>
-where K: Eq + 'static,
-      V: 'static
+where
+    K: Eq + 'static,
+    V: 'static,
 {
-    pub fn insert(&self, new_entry: BucketEntry<K, V>, guard: &Guard) -> bool {
+    pub fn insert<'g>(
+        &self,
+        new_entry: BucketEntry<K, V>,
+        guard: &'g Guard,
+    ) -> UpdateResult<'g, K, V> {
         let mut empty_entry = None;
         let mut last_bucket = self.bucket;
         for entry in self.bucket.entries(guard) {
@@ -199,10 +203,12 @@ where K: Eq + 'static,
             match cell_ref {
                 Some(cell_ref) => {
                     let sign = entry.load_signature();
-                    if sign == new_entry.sign {
-                        if cell_ref.0 == new_entry.key {
-                            return false;
+                    if sign == new_entry.sign && cell_ref.0 == new_entry.key {
+                        entry.store(new_entry);
+                        unsafe {
+                            guard.defer_destroy(cell);
                         }
+                        return UpdateResult::Replaced(cell_ref);
                     }
                 }
                 None => {
@@ -216,17 +222,24 @@ where K: Eq + 'static,
         match empty_entry {
             Some(entry) => {
                 entry.store(new_entry);
-                true
+                UpdateResult::New
             }
             None => {
                 let new_bucket = Bucket::new();
                 let entry = new_bucket.entries(guard).next().unwrap();
                 entry.store(new_entry);
                 last_bucket.next.store(Owned::new(new_bucket), Release);
-                true
+                UpdateResult::Overflow
             }
         }
     }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum UpdateResult<'g, K, V> {
+    New,
+    Replaced(&'g (K, V)),
+    Overflow,
 }
 
 #[cfg(test)]
@@ -248,14 +261,14 @@ mod tests {
         let pairs = (0..=6).map(|v| (v, v)).collect::<Vec<_>>();
         for pair in pairs.iter().copied() {
             let w = bucket.write();
-            assert!(w.insert(
+            assert_eq!(w.insert(
                 BucketEntry {
                     key: pair.0,
                     val: pair.1,
                     sign: 0
                 },
                 &guard
-            ));
+            ), UpdateResult::New);
         }
 
         for pair in pairs.iter() {
@@ -270,14 +283,14 @@ mod tests {
         let pairs = (0..=7).map(|v| (v, v)).collect::<Vec<_>>();
         for pair in pairs.iter().copied() {
             let w = bucket.write();
-            assert!(w.insert(
+            assert_eq!(w.insert(
                 BucketEntry {
                     key: pair.0,
                     val: pair.1,
                     sign: 0
                 },
                 &guard
-            ));
+            ), UpdateResult::New);
         }
 
         for pair in pairs.iter() {
@@ -292,11 +305,14 @@ mod tests {
         let pairs = (0..=20).map(|v| (v, v)).collect::<Vec<_>>();
         for pair in pairs.iter().copied() {
             let w = bucket.write();
-            assert!(w.insert(BucketEntry {
-                key: pair.0,
-                val: pair.1,
-                sign: 0
-            }, &guard));
+            assert_eq!(w.insert(
+                BucketEntry {
+                    key: pair.0,
+                    val: pair.1,
+                    sign: 0
+                },
+                &guard
+            ), UpdateResult::New);
         }
 
         for pair in pairs.iter() {
