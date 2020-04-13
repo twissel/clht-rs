@@ -2,7 +2,6 @@ use crate::bucket::{Bucket, BucketEntry};
 use crossbeam::epoch::*;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::Ordering::*;
-use wyhash::WyHash;
 
 pub struct HashMap<K, V> {
     buckets: Atomic<Box<[Bucket<K, V>]>>,
@@ -34,7 +33,8 @@ where
             let (bin, sign) = self.bin_and_signature(&key);
             let bucket = buckets.get_unchecked(bin);
             let entry = BucketEntry { key, val, sign };
-            bucket.insert(entry, &guard)
+            let w = bucket.write();
+            w.insert(entry, &guard)
         }
     }
 
@@ -78,7 +78,6 @@ impl<K, V> std::fmt::Debug for HashMap<K, V> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::cell::Cell;
     use std::sync::Arc;
     use std::thread;
 

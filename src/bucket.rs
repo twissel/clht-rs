@@ -1,6 +1,6 @@
 use crossbeam::epoch::*;
 //use parking_lot::Mutex;
-use crate::lock::Mutex;
+use crate::lock::{Mutex, MutexGuard};
 use std::sync::atomic::{
     AtomicU8,
     Ordering::{Acquire, Release},
@@ -123,11 +123,75 @@ where
         }
     }
 
+    pub fn find<'g>(&self, key: &K, signature: u8, guard: &'g Guard) -> Option<&'g V> {
+        self.entries(guard).find_map(|entry| {
+            let cell = entry.load_cell(guard);
+            let cell_ref = unsafe { cell.as_ref() };
+            match cell_ref {
+                Some(cell_ref) => {
+                    let cell_signature = entry.load_signature();
+                    if cell_signature == signature {
+                        if *key == cell_ref.0 {
+                            Some(&cell_ref.1)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            }
+        })
+    }
+
+    pub fn write(&self) -> WriteGuard<'_, K, V> {
+        let guard = self.lock.lock();
+        WriteGuard {
+            _guard: guard,
+            bucket: self
+        }
+    }
+}
+
+impl<K, V> Bucket<K, V> {
+    fn clean_cells(&mut self) {
+        unsafe {
+            for cell in &self.cells {
+                let pair = cell.load(Acquire, unprotected());
+                if let Some(_) = pair.as_ref() {
+                    let _ = pair.into_owned();
+                }
+            }
+        }
+    }
+}
+
+impl<K, V> Drop for Bucket<K, V> {
+    fn drop(&mut self) {
+        unsafe {
+            self.clean_cells();
+            let next = self.next.load(Acquire, unprotected());
+            if let Some(_) = next.as_ref() {
+                let _ = next.into_owned();
+            }
+        }
+    }
+}
+
+pub struct WriteGuard<'a, K, V> {
+    _guard: MutexGuard<'a>,
+    bucket: &'a Bucket<K, V>
+}
+
+impl<'a, K, V> WriteGuard<'a, K, V>
+where K: Eq + 'static,
+      V: 'static
+{
     pub fn insert(&self, new_entry: BucketEntry<K, V>, guard: &Guard) -> bool {
-        let _lock = self.lock.lock();
         let mut empty_entry = None;
-        let mut last_bucket = self;
-        for entry in self.entries(guard) {
+        let mut last_bucket = self.bucket;
+        for entry in self.bucket.entries(guard) {
             last_bucket = entry.bucket;
             let cell = entry.load_cell(guard);
             let cell_ref = unsafe { cell.as_ref() };
@@ -163,53 +227,6 @@ where
             }
         }
     }
-
-    pub fn find<'g>(&self, key: &K, signature: u8, guard: &'g Guard) -> Option<&'g V> {
-        self.entries(guard).find_map(|entry| {
-            let cell = entry.load_cell(guard);
-            let cell_ref = unsafe { cell.as_ref() };
-            match cell_ref {
-                Some(cell_ref) => {
-                    let cell_signature = entry.load_signature();
-                    if cell_signature == signature {
-                        if *key == cell_ref.0 {
-                            Some(&cell_ref.1)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                }
-                None => None,
-            }
-        })
-    }
-}
-
-impl<K, V> Bucket<K, V> {
-    fn clean_cells(&mut self) {
-        unsafe {
-            for cell in &self.cells {
-                let pair = cell.load(Acquire, unprotected());
-                if let Some(pair_ref) = pair.as_ref() {
-                    let _ = pair.into_owned();
-                }
-            }
-        }
-    }
-}
-
-impl<K, V> Drop for Bucket<K, V> {
-    fn drop(&mut self) {
-        unsafe {
-            self.clean_cells();
-            let next = self.next.load(Acquire, unprotected());
-            if let Some(_) = next.as_ref() {
-                let _ = next.into_owned();
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -230,7 +247,8 @@ mod tests {
         let guard = pin();
         let pairs = (0..=6).map(|v| (v, v)).collect::<Vec<_>>();
         for pair in pairs.iter().copied() {
-            assert!(bucket.insert(
+            let w = bucket.write();
+            assert!(w.insert(
                 BucketEntry {
                     key: pair.0,
                     val: pair.1,
@@ -251,7 +269,8 @@ mod tests {
         let guard = pin();
         let pairs = (0..=7).map(|v| (v, v)).collect::<Vec<_>>();
         for pair in pairs.iter().copied() {
-            assert!(bucket.insert(
+            let w = bucket.write();
+            assert!(w.insert(
                 BucketEntry {
                     key: pair.0,
                     val: pair.1,
@@ -272,7 +291,8 @@ mod tests {
         let guard = pin();
         let pairs = (0..=20).map(|v| (v, v)).collect::<Vec<_>>();
         for pair in pairs.iter().copied() {
-            assert!(bucket.insert(BucketEntry {
+            let w = bucket.write();
+            assert!(w.insert(BucketEntry {
                 key: pair.0,
                 val: pair.1,
                 sign: 0
