@@ -1,11 +1,44 @@
 use crate::bucket::{Bucket, BucketEntry, UpdateResult};
 use crossbeam::epoch::*;
+use crossbeam::utils::Backoff;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::Ordering::*;
 
-pub struct HashMap<K, V> {
-    buckets: Atomic<Box<[Bucket<K, V>]>>,
+fn hash<T: Hash>(data: T) -> u64 {
+    let mut hasher = ahash::AHasher::default();
+    data.hash(&mut hasher);
+    hasher.finish()
+}
+
+struct RawTable<K, V> {
+    buckets: Box<[Bucket<K, V>]>,
     cap_log2: u32,
+}
+
+impl<K, V> RawTable<K, V>
+where
+    K: Hash,
+{
+    fn bucket_index(&self, hash: u64) -> usize {
+        let index = hash >> (64 - self.cap_log2 as u64);
+        index as usize
+    }
+
+    fn bucket_for_hash(&self, hash: u64) -> &Bucket<K, V> {
+        let index = self.bucket_index(hash);
+        unsafe { self.buckets.get_unchecked(index) }
+    }
+
+    fn signature(&self, hash: u64) -> u8 {
+        let sign = hash >> (64 - 8 - self.cap_log2 as u64) & ((1 << 8) - 1);
+        sign as u8
+    }
+}
+const RAW_TABLE_STATE_QUIESCENCE: usize = 0;
+const RAW_TABLE_STATE_GROWING: usize = 1;
+
+pub struct HashMap<K, V> {
+    raw_ptr: Atomic<RawTable<K, V>>,
 }
 
 impl<K, V> HashMap<K, V>
@@ -22,54 +55,88 @@ where
         let cap = 2usize.pow(pow);
         let buckets = (0..cap).map(|_| Bucket::new()).collect::<Vec<_>>();
         Self {
-            buckets: Atomic::new(buckets.into_boxed_slice()),
-            cap_log2: pow,
+            raw_ptr: Atomic::new(RawTable {
+                buckets: buckets.into_boxed_slice(),
+                cap_log2: pow,
+            }),
         }
     }
 
     pub fn insert<'g>(&self, key: K, val: V, guard: &'g Guard) -> Option<&'g (K, V)> {
-        unsafe {
-            let buckets = self.buckets.load(SeqCst, guard).deref();
-            let (bin, sign) = self.bin_and_signature(&key);
-            let bucket = buckets.get_unchecked(bin);
-            let entry = BucketEntry { key, val, sign };
-            let w = bucket.write();
-            let res = w.insert(entry, &guard);
-            match res {
-                UpdateResult::New => None,
-                UpdateResult::Overflow => None,
-                UpdateResult::Replaced(rep) => Some(rep)
+        let key_hash = hash(&key);
+        let backoff = Backoff::new();
+        loop {
+            let old_raw = self.raw_ptr.load(Acquire, guard);
+            match old_raw.tag() {
+                RAW_TABLE_STATE_QUIESCENCE => {
+                    // at least at line above table was in quiescence,
+                    // try to find and lock bucket for insert
+                    let raw_ref = unsafe { old_raw.deref() };
+                    let bucket = raw_ref.bucket_for_hash(key_hash);
+                    let bucket_write = bucket.write();
+
+                    // we locked the bucket, check that table was not resized before we locked the bucket,
+                    // or concurrent resize started
+                    let cur_raw = self.raw_ptr.load(Acquire, guard);
+                    if cur_raw.tag() != RAW_TABLE_STATE_GROWING && old_raw != cur_raw {
+
+                        // old_raw == cur_raw, we can use raw_ref safely
+                        let key_sig = raw_ref.signature(key_hash);
+                        let ins_res = bucket_write.insert(BucketEntry {
+                            key,
+                            val,
+                            sign: key_sig
+                        }, guard);
+
+                        match ins_res {
+                            UpdateResult::UpdatedWithOverflow => {
+                                // TODO: grow if needed
+                                return None;
+                            },
+                            UpdateResult::Updated(old_pair) => {
+                                return old_pair;
+                            }
+                        }
+
+                    } else {
+                        // concurrent resize is going or table was resized, retry later
+                        backoff.snooze();
+                        continue;
+                    }
+                }
+                RAW_TABLE_STATE_GROWING => {
+                    backoff.snooze();
+                    continue;
+                }
+                _ => unreachable!("Invalid RawTable state/tag"),
             }
         }
     }
 
     pub fn get<'g>(&self, key: &K, guard: &'g Guard) -> Option<&'g V> {
-        unsafe {
-            let buckets = self.buckets.load(SeqCst, guard).deref();
-            let (bin, signature) = self.bin_and_signature(key);
-            let bucket = buckets.get_unchecked(bin);
-            bucket.find(key, signature, &guard)
-        }
+        /*unsafe {
+            let key_hash = hash(key);
+            let bucket = self.bucket_for_hash(key_hash, guard);
+
+            bucket.find(key, sign, guard)
+        }*/
+        unimplemented!()
     }
 
-    #[inline(never)]
-    fn bin_and_signature(&self, key: &K) -> (usize, u8) {
-        let mut hasher = ahash::AHasher::default();
-        key.hash(&mut hasher);
-        let hash = hasher.finish();
-        let cap_log2 = self.cap_log2;
-        let index = hash >> (64 - cap_log2 as u64);
-        let sign = hash >> (64 - 8 - cap_log2 as u64) & ((1 << 8) - 1);
-        (index as usize, sign as u8)
-    }
+    /*fn bucket_for_hash<'g>(&self, hash: u64, guard: &'g Guard) -> &'g Bucket<K, V> {
+        unsafe {
+            let raw_ref = self.raw_ptr.load(Acquire, guard).deref();
+            raw_ref.bucket_for_hash(hash)
+        }
+    }*/
 }
 
 impl<K, V> Drop for HashMap<K, V> {
     fn drop(&mut self) {
         unsafe {
             // TODO: use Relaxed in all drops
-            let buckets = self.buckets.load(Acquire, unprotected());
-            let _ = buckets.into_owned();
+            let raw = self.raw_ptr.load(Acquire, unprotected());
+            let _ = raw.into_owned();
         }
     }
 }

@@ -124,22 +124,26 @@ where
 
     pub fn find<'g>(&self, key: &K, signature: u8, guard: &'g Guard) -> Option<&'g V> {
         self.entries(guard).find_map(|entry| {
-            let cell = entry.load_cell(guard);
-            let cell_ref = unsafe { cell.as_ref() };
-            match cell_ref {
-                Some(cell_ref) => {
-                    let cell_signature = entry.load_signature();
-                    if cell_signature == signature {
-                        if *key == cell_ref.0 {
-                            Some(&cell_ref.1)
+            let cell_signature = entry.load_signature();
+            if cell_signature == signature {
+                let cell = entry.load_cell(guard);
+                let cell_ref = unsafe { cell.as_ref() };
+                match cell_ref {
+                    Some(cell_ref) => {
+                        if cell_signature == signature {
+                            if *key == cell_ref.0 {
+                                Some(&cell_ref.1)
+                            } else {
+                                None
+                            }
                         } else {
                             None
                         }
-                    } else {
-                        None
                     }
+                    None => None,
                 }
-                None => None,
+            } else {
+                None
             }
         })
     }
@@ -158,7 +162,7 @@ impl<K, V> Bucket<K, V> {
         unsafe {
             for cell in &self.cells {
                 let pair = cell.load(Acquire, unprotected());
-                if let Some(_) = pair.as_ref() {
+                if pair.as_ref().is_some() {
                     let _ = pair.into_owned();
                 }
             }
@@ -171,7 +175,7 @@ impl<K, V> Drop for Bucket<K, V> {
         unsafe {
             self.clean_cells();
             let next = self.next.load(Acquire, unprotected());
-            if let Some(_) = next.as_ref() {
+            if next.as_ref().is_some() {
                 let _ = next.into_owned();
             }
         }
@@ -208,7 +212,7 @@ where
                         unsafe {
                             guard.defer_destroy(cell);
                         }
-                        return UpdateResult::Replaced(cell_ref);
+                        return UpdateResult::Updated(Some(cell_ref));
                     }
                 }
                 None => {
@@ -222,14 +226,14 @@ where
         match empty_entry {
             Some(entry) => {
                 entry.store(new_entry);
-                UpdateResult::New
+                UpdateResult::Updated(None)
             }
             None => {
                 let new_bucket = Bucket::new();
                 let entry = new_bucket.entries(guard).next().unwrap();
                 entry.store(new_entry);
                 last_bucket.next.store(Owned::new(new_bucket), Release);
-                UpdateResult::Overflow
+                UpdateResult::UpdatedWithOverflow
             }
         }
     }
@@ -237,38 +241,46 @@ where
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum UpdateResult<'g, K, V> {
-    New,
-    Replaced(&'g (K, V)),
-    Overflow,
+    Updated(Option<&'g (K, V)>),
+    UpdatedWithOverflow,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn test_simple_insert() {
-        /*let bucket = Bucket::new();
-        let guard = pin();
-        assert!(bucket.insert(0, 0, &guard));
-        assert_eq!(bucket.find(&0, &guard), Some(&0));*/
-        unimplemented!()
-    }
 
     #[test]
     fn test_insert_when_bucket_full_no_next() {
         let bucket = Bucket::new();
         let guard = pin();
-        let pairs = (0..=6).map(|v| (v, v)).collect::<Vec<_>>();
-        for pair in pairs.iter().copied() {
+        let pairs = (0..=5).map(|v| (v, v)).collect::<Vec<_>>();
+        for (idx, pair) in pairs.iter().copied().enumerate() {
             let w = bucket.write();
-            assert_eq!(w.insert(
-                BucketEntry {
-                    key: pair.0,
-                    val: pair.1,
-                    sign: 0
-                },
-                &guard
-            ), UpdateResult::New);
+            if idx < 5 {
+                assert_eq!(
+                    w.insert(
+                        BucketEntry {
+                            key: pair.0,
+                            val: pair.1,
+                            sign: 0
+                        },
+                        &guard
+                    ),
+                    UpdateResult::Updated(None)
+                );
+            } else {
+                assert_eq!(
+                    w.insert(
+                        BucketEntry {
+                            key: pair.0,
+                            val: pair.1,
+                            sign: 0
+                        },
+                        &guard
+                    ),
+                    UpdateResult::UpdatedWithOverflow
+                );
+            }
         }
 
         for pair in pairs.iter() {
@@ -280,17 +292,34 @@ mod tests {
     fn test_insert_when_bucket_full_nas_next() {
         let bucket = Bucket::new();
         let guard = pin();
-        let pairs = (0..=7).map(|v| (v, v)).collect::<Vec<_>>();
-        for pair in pairs.iter().copied() {
+        let pairs = (0..=6).map(|v| (v, v)).collect::<Vec<_>>();
+        for (idx, pair) in pairs.iter().copied().enumerate() {
             let w = bucket.write();
-            assert_eq!(w.insert(
-                BucketEntry {
-                    key: pair.0,
-                    val: pair.1,
-                    sign: 0
-                },
-                &guard
-            ), UpdateResult::New);
+            if idx != 5 {
+                assert_eq!(
+                    w.insert(
+                        BucketEntry {
+                            key: pair.0,
+                            val: pair.1,
+                            sign: 0
+                        },
+                        &guard
+                    ),
+                    UpdateResult::Updated(None)
+                );
+            } else {
+                assert_eq!(
+                    w.insert(
+                        BucketEntry {
+                            key: pair.0,
+                            val: pair.1,
+                            sign: 0
+                        },
+                        &guard
+                    ),
+                    UpdateResult::UpdatedWithOverflow
+                );
+            }
         }
 
         for pair in pairs.iter() {
@@ -305,14 +334,14 @@ mod tests {
         let pairs = (0..=20).map(|v| (v, v)).collect::<Vec<_>>();
         for pair in pairs.iter().copied() {
             let w = bucket.write();
-            assert_eq!(w.insert(
+            w.insert(
                 BucketEntry {
                     key: pair.0,
                     val: pair.1,
-                    sign: 0
+                    sign: 0,
                 },
-                &guard
-            ), UpdateResult::New);
+                &guard,
+            );
         }
 
         for pair in pairs.iter() {

@@ -24,7 +24,7 @@ fn task_insert_u64_u64(threads: usize) -> HashMap<u64, u64> {
                 let start = t * inc;
                 let guard = epoch::pin();
                 for i in start..(start + inc) {
-                    assert!(m.insert(i, i + 7, &guard));
+                    assert_eq!(m.insert(i, i + 7, &guard), None);
                 }
             });
         }
