@@ -32,6 +32,11 @@ impl<'a, K, V> BucketEntryRef<'a, K, V> {
         self.signature.store(entry.sign, Release);
         self.cell.store(Owned::new((entry.key, entry.val)), Release);
     }
+
+    fn clear(&self) {
+        self.signature.store(0, Release);
+        self.cell.store(Shared::null(), Release);
+    }
 }
 
 pub struct BucketEntryRefIter<'g, K, V> {
@@ -155,6 +160,10 @@ where
             bucket: self,
         }
     }
+
+    pub fn num_overflows(&self, guard: &Guard) -> usize {
+        unimplemented!()
+    }
 }
 
 impl<K, V> Bucket<K, V> {
@@ -236,6 +245,30 @@ where
                 UpdateResult::UpdatedWithOverflow
             }
         }
+    }
+
+    pub fn remove<'g>(&self, key: &K, key_sign: u8, guard: &'g Guard) -> Option<&'g V> {
+        for entry in self.bucket.entries(guard) {
+            let cell = entry.load_cell(guard);
+            let cell_ref = unsafe { cell.as_ref() };
+
+            match cell_ref {
+                Some(cell_ref) => {
+                    let entry_sign = entry.load_signature();
+                    if entry_sign == key_sign && cell_ref.0 == *key {
+                        entry.clear();
+                        unsafe {
+                            guard.defer_destroy(cell);
+                        }
+                        return Some(&cell_ref.1);
+                    }
+                }
+                None => {
+                    continue;
+                }
+            }
+        }
+        None
     }
 }
 

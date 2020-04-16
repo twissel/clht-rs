@@ -1,4 +1,4 @@
-use crate::bucket::{Bucket, BucketEntry, UpdateResult};
+use crate::bucket::{Bucket, BucketEntry, UpdateResult, WriteGuard};
 use crossbeam::epoch::*;
 use crossbeam::utils::Backoff;
 use std::hash::{Hash, Hasher};
@@ -33,6 +33,10 @@ where
         let sign = hash >> (64 - 8 - self.cap_log2 as u64) & ((1 << 8) - 1);
         sign as u8
     }
+
+    fn count_num_of_overflows(&self) -> usize {
+        unimplemented!()
+    }
 }
 const RAW_TABLE_STATE_QUIESCENCE: usize = 0;
 const RAW_TABLE_STATE_GROWING: usize = 1;
@@ -62,8 +66,48 @@ where
         }
     }
 
-    pub fn insert<'g>(&self, key: K, val: V, guard: &'g Guard) -> Option<&'g (K, V)> {
+    pub fn insert<'g>(&self, key: K, val: V, guard: &'g Guard) -> Option<&'g V> {
         let key_hash = hash(&key);
+
+        self.run_locked(
+            key_hash,
+            move |bucket, sign, g| {
+                let ins_res = bucket.insert(BucketEntry { key, val, sign }, g);
+
+                match ins_res {
+                    UpdateResult::UpdatedWithOverflow => {
+                        // TODO: grow if needed
+                        None
+                    }
+                    UpdateResult::Updated(old_pair) => old_pair.map(|pair| &pair.1),
+                }
+            },
+            guard,
+        )
+    }
+
+    pub fn get<'g>(&self, key: &K, guard: &'g Guard) -> Option<&'g V> {
+        let key_hash = hash(key);
+        let raw_ref = unsafe { self.raw_ptr.load(Acquire, guard).deref() };
+        let bucket = raw_ref.bucket_for_hash(key_hash);
+        let sign = raw_ref.signature(key_hash);
+        bucket.find(key, sign, guard)
+    }
+
+    pub fn remove<'g>(&self, key: &K, guard: &'g Guard) -> Option<&'g V> {
+        let key_hash = hash(&key);
+
+        self.run_locked(
+            key_hash,
+            move |bucket, sign, g| bucket.remove(&key, sign, g),
+            guard,
+        )
+    }
+
+    fn run_locked<'g, F, R: 'g>(&self, key_hash: u64, func: F, guard: &'g Guard) -> R
+    where
+        for<'a> F: FnOnce(WriteGuard<'a, K, V>, u8, &'g Guard) -> R,
+    {
         let backoff = Backoff::new();
         loop {
             let old_raw = self.raw_ptr.load(Acquire, guard);
@@ -78,26 +122,10 @@ where
                     // we locked the bucket, check that table was not resized before we locked the bucket,
                     // or concurrent resize started
                     let cur_raw = self.raw_ptr.load(Acquire, guard);
-                    if cur_raw.tag() != RAW_TABLE_STATE_GROWING && old_raw != cur_raw {
-
+                    if cur_raw.tag() != RAW_TABLE_STATE_GROWING && old_raw == cur_raw {
                         // old_raw == cur_raw, we can use raw_ref safely
                         let key_sig = raw_ref.signature(key_hash);
-                        let ins_res = bucket_write.insert(BucketEntry {
-                            key,
-                            val,
-                            sign: key_sig
-                        }, guard);
-
-                        match ins_res {
-                            UpdateResult::UpdatedWithOverflow => {
-                                // TODO: grow if needed
-                                return None;
-                            },
-                            UpdateResult::Updated(old_pair) => {
-                                return old_pair;
-                            }
-                        }
-
+                        return func(bucket_write, key_sig, guard);
                     } else {
                         // concurrent resize is going or table was resized, retry later
                         backoff.snooze();
@@ -112,23 +140,6 @@ where
             }
         }
     }
-
-    pub fn get<'g>(&self, key: &K, guard: &'g Guard) -> Option<&'g V> {
-        /*unsafe {
-            let key_hash = hash(key);
-            let bucket = self.bucket_for_hash(key_hash, guard);
-
-            bucket.find(key, sign, guard)
-        }*/
-        unimplemented!()
-    }
-
-    /*fn bucket_for_hash<'g>(&self, hash: u64, guard: &'g Guard) -> &'g Bucket<K, V> {
-        unsafe {
-            let raw_ref = self.raw_ptr.load(Acquire, guard).deref();
-            raw_ref.bucket_for_hash(hash)
-        }
-    }*/
 }
 
 impl<K, V> Drop for HashMap<K, V> {
