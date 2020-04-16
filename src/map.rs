@@ -1,4 +1,4 @@
-use crate::bucket::{Bucket, BucketEntry, UpdateResult, WriteGuard};
+use crate::bucket::{Bucket, BucketEntry, UpdateResult, WriteGuard, ENTRIES_PER_BUCKET};
 use crossbeam::epoch::*;
 use crossbeam::utils::Backoff;
 use std::hash::{Hash, Hasher};
@@ -69,21 +69,19 @@ where
     pub fn insert<'g>(&self, key: K, val: V, guard: &'g Guard) -> Option<&'g V> {
         let key_hash = hash(&key);
 
-        self.run_locked(
+        let ins_res = self.run_locked(
             key_hash,
-            move |bucket, sign, g| {
-                let ins_res = bucket.insert(BucketEntry { key, val, sign }, g);
-
-                match ins_res {
-                    UpdateResult::UpdatedWithOverflow => {
-                        // TODO: grow if needed
-                        None
-                    }
-                    UpdateResult::Updated(old_pair) => old_pair.map(|pair| &pair.1),
-                }
-            },
+            move |bucket, sign, g| bucket.insert(BucketEntry { key, val, sign }, g),
             guard,
-        )
+        );
+
+        match ins_res {
+            UpdateResult::UpdatedWithOverflow => {
+                // TODO: grow if needed
+                None
+            }
+            UpdateResult::Updated(old_pair) => old_pair.map(|pair| &pair.1),
+        }
     }
 
     pub fn get<'g>(&self, key: &K, guard: &'g Guard) -> Option<&'g V> {
@@ -115,12 +113,13 @@ where
                 RAW_TABLE_STATE_QUIESCENCE => {
                     // at least at line above table was in quiescence,
                     // try to find and lock bucket for insert
+
                     let raw_ref = unsafe { old_raw.deref() };
                     let bucket = raw_ref.bucket_for_hash(key_hash);
                     let bucket_write = bucket.write();
 
                     // we locked the bucket, check that table was not resized before we locked the bucket,
-                    // or concurrent resize started
+                    // or concurrent resize was started
                     let cur_raw = self.raw_ptr.load(Acquire, guard);
                     if cur_raw.tag() != RAW_TABLE_STATE_GROWING && old_raw == cur_raw {
                         // old_raw == cur_raw, we can use raw_ref safely
@@ -140,6 +139,30 @@ where
             }
         }
     }
+
+    fn stats(&self, guard: &Guard) -> Stats {
+        let raw = self.raw_ptr.load(Acquire, guard);
+        let raw_ref = unsafe { raw.deref() };
+        let mut num_occupied = 0;
+        let mut expands_max = 0;
+        for bucket in &*raw_ref.buckets {
+            let bucket_stats = bucket.stats(guard);
+            num_occupied += bucket_stats.num_occupied;
+            if bucket_stats.num_overflows > expands_max {
+                expands_max = bucket_stats.num_overflows;
+            }
+        }
+        Stats {
+            full_ratio: 100f64 * num_occupied as f64 / (raw_ref.buckets.len() * ENTRIES_PER_BUCKET) as f64,
+            expands_max
+        }
+    }
+}
+
+#[derive(Default, Debug)]
+struct Stats {
+    full_ratio: f64,
+    expands_max: usize
 }
 
 impl<K, V> Drop for HashMap<K, V> {
@@ -166,7 +189,7 @@ mod test {
 
     #[test]
     fn test_simple_insert() {
-        let map = Arc::new(HashMap::with_pow_buckets(8));
+        let map = Arc::new(HashMap::with_pow_buckets(1));
         let handles = (0..=2)
             .map(|v| {
                 let m = Arc::clone(&map);
@@ -184,5 +207,8 @@ mod test {
         for k in 0..=2 {
             assert_eq!(map.get(&k, &g), Some(&k));
         }
+
+        let stats = map.stats(&g);
+        dbg!(stats);
     }
 }

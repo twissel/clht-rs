@@ -1,10 +1,12 @@
-use crossbeam::epoch::*;
-//use parking_lot::Mutex;
 use crate::lock::{Mutex, MutexGuard};
+use crossbeam::epoch::*;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::{
     AtomicU8,
     Ordering::{Acquire, Release},
 };
+
+pub const ENTRIES_PER_BUCKET: usize = 5;
 
 pub struct BucketEntry<K, V> {
     pub key: K,
@@ -161,9 +163,35 @@ where
         }
     }
 
-    pub fn num_overflows(&self, guard: &Guard) -> usize {
-        unimplemented!()
+    pub fn stats(&self, guard: &Guard) -> Stats {
+        let mut stats = Stats::default();
+
+        let mut cur_bucket = Some(self);
+        while let Some(bucket) = cur_bucket {
+            for cell in &bucket.cells {
+                // as we don't touch cell data, we can use relaxed ordering here
+                let pair = cell.load(Relaxed, guard);
+                if !pair.is_null() {
+                    stats.num_occupied += 1;
+                }
+            }
+
+            let next_bucket = bucket.next.load(Acquire, guard);
+            if !next_bucket.is_null() {
+                stats.num_overflows += 1;
+            }
+
+            // safe as we used Acquire on bucket load
+            cur_bucket = unsafe { next_bucket.as_ref() };
+        }
+        stats
     }
+}
+
+#[derive(Default, Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Stats {
+    pub num_overflows: usize,
+    pub num_occupied: usize,
 }
 
 impl<K, V> Bucket<K, V> {
@@ -319,6 +347,12 @@ mod tests {
         for pair in pairs.iter() {
             assert_eq!(bucket.find(&pair.0, 0, &guard), Some(&pair.1));
         }
+
+        let stats = bucket.stats(&guard);
+        assert_eq!(stats, Stats {
+            num_overflows: 1,
+            num_occupied: 6
+        })
     }
 
     #[test]
@@ -358,6 +392,12 @@ mod tests {
         for pair in pairs.iter() {
             assert_eq!(bucket.find(&pair.0, 0, &guard), Some(&pair.1));
         }
+
+        let stats = bucket.stats(&guard);
+        assert_eq!(stats, Stats {
+            num_overflows: 1,
+            num_occupied: 7
+        })
     }
 
     #[test]
