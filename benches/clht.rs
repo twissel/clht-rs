@@ -1,5 +1,5 @@
 use clht_rs::HashMap;
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use crossbeam::epoch;
 use rayon;
 use rayon::prelude::*;
@@ -14,7 +14,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 const ITER: u64 = 32 * 1024;
 
 fn task_insert_u64_u64(threads: usize) -> HashMap<u64, u64> {
-    let map = Arc::new(HashMap::with_pow_buckets(12));
+    let map = Arc::new(HashMap::with_pow_buckets(18));
     let inc = ITER / (threads as u64);
 
     rayon::scope(|s| {
@@ -24,6 +24,26 @@ fn task_insert_u64_u64(threads: usize) -> HashMap<u64, u64> {
                 let start = t * inc;
                 let guard = epoch::pin();
                 for i in start..(start + inc) {
+                    assert_eq!(m.insert(i, i + 7, &guard), None);
+                }
+            });
+        }
+    });
+
+    Arc::try_unwrap(map).unwrap()
+}
+
+fn task_insert_u64_u64_same_map(map: Arc<HashMap<u64, u64>>, threads: usize) -> HashMap<u64, u64> {
+    let inc = ITER / (threads as u64);
+
+    rayon::scope(|s| {
+        for t in 1..=(threads as u64) {
+            let m = map.clone();
+            s.spawn(move |_| {
+                let start = t * inc;
+                let guard = epoch::pin();
+                let end = start + inc;
+                for i in start..end {
                     assert_eq!(m.insert(i, i + 7, &guard), None);
                 }
             });
@@ -47,7 +67,13 @@ fn insert_u64_u64(c: &mut Criterion) {
                     .num_threads(threads)
                     .build()
                     .unwrap();
-                pool.install(|| b.iter_with_large_drop(|| task_insert_u64_u64(threads)));
+                pool.install(|| {
+                    b.iter_batched(
+                        || Arc::new(HashMap::with_pow_buckets(12)),
+                        |map| task_insert_u64_u64_same_map(map, threads),
+                        BatchSize::SmallInput,
+                    )
+                });
             },
         );
     }

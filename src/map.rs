@@ -4,6 +4,11 @@ use crossbeam::utils::Backoff;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::Ordering::*;
 
+const PERC_FULL_DOUBLE: f64 = 50.0;
+const MAX_EXPANSIONS: usize = 24;
+const RAW_TABLE_STATE_QUIESCENCE: usize = 0;
+const RAW_TABLE_STATE_GROWING: usize = 1;
+
 fn hash<T: Hash>(data: T) -> u64 {
     let mut hasher = ahash::AHasher::default();
     data.hash(&mut hasher);
@@ -33,13 +38,7 @@ where
         let sign = hash >> (64 - 8 - self.cap_log2 as u64) & ((1 << 8) - 1);
         sign as u8
     }
-
-    fn count_num_of_overflows(&self) -> usize {
-        unimplemented!()
-    }
 }
-const RAW_TABLE_STATE_QUIESCENCE: usize = 0;
-const RAW_TABLE_STATE_GROWING: usize = 1;
 
 pub struct HashMap<K, V> {
     raw_ptr: Atomic<RawTable<K, V>>,
@@ -71,13 +70,15 @@ where
 
         let ins_res = self.run_locked(
             key_hash,
-            move |bucket, sign, g| bucket.insert(BucketEntry { key, val, sign }, g),
+            move |table_ptr, bucket, sign, g| {
+                (table_ptr, bucket.insert(BucketEntry { key, val, sign }, g))
+            },
             guard,
         );
-
+        let (table_ptr, ins_res) = ins_res;
         match ins_res {
             UpdateResult::UpdatedWithOverflow => {
-                // TODO: grow if needed
+                self.try_grow(table_ptr, guard);
                 None
             }
             UpdateResult::Updated(old_pair) => old_pair.map(|pair| &pair.1),
@@ -97,64 +98,78 @@ where
 
         self.run_locked(
             key_hash,
-            move |bucket, sign, g| bucket.remove(&key, sign, g),
+            move |_, bucket, sign, g| bucket.remove(&key, sign, g),
             guard,
         )
     }
 
     fn run_locked<'g, F, R: 'g>(&self, key_hash: u64, func: F, guard: &'g Guard) -> R
     where
-        for<'a> F: FnOnce(WriteGuard<'a, K, V>, u8, &'g Guard) -> R,
+        for<'a> F: FnOnce(Shared<'g, RawTable<K, V>>, WriteGuard<'a, K, V>, u8, &'g Guard) -> R,
     {
         let backoff = Backoff::new();
         loop {
             let old_raw = self.raw_ptr.load(Acquire, guard);
-            match old_raw.tag() {
-                RAW_TABLE_STATE_QUIESCENCE => {
-                    // at least at line above table was in quiescence,
-                    // try to find and lock bucket for insert
+            {
+                // at least at line above table was not in growing state,
+                // try to find and lock bucket for insert
 
-                    let raw_ref = unsafe { old_raw.deref() };
-                    let bucket = raw_ref.bucket_for_hash(key_hash);
-                    let bucket_write = bucket.write();
+                let raw_ref = unsafe { old_raw.deref() };
+                let bucket = raw_ref.bucket_for_hash(key_hash);
+                let bucket_write = bucket.write();
 
-                    // we locked the bucket, check that table was not resized before we locked the bucket,
-                    // or concurrent resize was started
-                    let cur_raw = self.raw_ptr.load(Acquire, guard);
-                    if cur_raw.tag() != RAW_TABLE_STATE_GROWING && old_raw == cur_raw {
-                        // old_raw == cur_raw, we can use raw_ref safely
-                        let key_sig = raw_ref.signature(key_hash);
-                        return func(bucket_write, key_sig, guard);
-                    } else {
-                        // concurrent resize is going or table was resized, retry later
-                        backoff.snooze();
-                        continue;
-                    }
+                // we locked the bucket, check that table was not resized before we locked the bucket,
+                //TODO: add note why we can't miss resize here
+                let cur_raw = self.raw_ptr.load(Acquire, guard);
+
+                if old_raw == cur_raw {
+                    // old_raw == old_raw, we can use raw_ref safely
+                    let key_sig = raw_ref.signature(key_hash);
+                    return func(cur_raw, bucket_write, key_sig, guard);
                 }
-                RAW_TABLE_STATE_GROWING => {
-                    backoff.snooze();
-                    continue;
-                }
-                _ => unreachable!("Invalid RawTable state/tag"),
+                // concurrent resize is going or table was resized, retry later
+                backoff.snooze();
+                continue;
             }
         }
     }
 
-    fn stats(&self, guard: &Guard) -> Stats {
-        let raw = self.raw_ptr.load(Acquire, guard);
-        let raw_ref = unsafe { raw.deref() };
-        let mut num_occupied = 0;
-        let mut expands_max = 0;
-        for bucket in &*raw_ref.buckets {
-            let bucket_stats = bucket.stats(guard);
-            num_occupied += bucket_stats.num_occupied;
-            if bucket_stats.num_overflows > expands_max {
-                expands_max = bucket_stats.num_overflows;
+    fn try_grow<'g>(&self, raw_shared: Shared<'g, RawTable<K, V>>, guard: &'g Guard) {
+        if raw_shared.tag() == RAW_TABLE_STATE_QUIESCENCE {
+            match self.raw_ptr.compare_and_set(
+                raw_shared,
+                raw_shared.with_tag(RAW_TABLE_STATE_GROWING),
+                Acquire,
+                guard,
+            ) {
+                Ok(raw_shared) => {
+                    let raw_ref = unsafe { raw_shared.deref() };
+                    let mut num_occupied = 0;
+                    let mut expands_max = 0;
+                    for bucket in &*raw_ref.buckets {
+                        let bucket_stats = bucket.stats(guard);
+                        num_occupied += bucket_stats.num_occupied;
+                        if bucket_stats.num_overflows > expands_max {
+                            expands_max = bucket_stats.num_overflows;
+                        }
+                    }
+
+                    let stats = Stats {
+                        full_ratio: 100f64 * num_occupied as f64
+                            / (raw_ref.buckets.len() * ENTRIES_PER_BUCKET) as f64,
+                        expands_max,
+                    };
+
+                    let mut guards = Vec::new();
+                    if stats.grow_needed() {
+
+                    } else {
+                        self.raw_ptr
+                            .store(raw_shared.with_tag(RAW_TABLE_STATE_QUIESCENCE), Release);
+                    }
+                }
+                Err(_) => {}
             }
-        }
-        Stats {
-            full_ratio: 100f64 * num_occupied as f64 / (raw_ref.buckets.len() * ENTRIES_PER_BUCKET) as f64,
-            expands_max
         }
     }
 }
@@ -162,7 +177,13 @@ where
 #[derive(Default, Debug)]
 struct Stats {
     full_ratio: f64,
-    expands_max: usize
+    expands_max: usize,
+}
+
+impl Stats {
+    fn grow_needed(&self) -> bool {
+        self.full_ratio > PERC_FULL_DOUBLE || self.expands_max > MAX_EXPANSIONS
+    }
 }
 
 impl<K, V> Drop for HashMap<K, V> {
@@ -207,8 +228,5 @@ mod test {
         for k in 0..=2 {
             assert_eq!(map.get(&k, &g), Some(&k));
         }
-
-        let stats = map.stats(&g);
-        dbg!(stats);
     }
 }

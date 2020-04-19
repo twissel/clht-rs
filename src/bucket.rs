@@ -349,10 +349,13 @@ mod tests {
         }
 
         let stats = bucket.stats(&guard);
-        assert_eq!(stats, Stats {
-            num_overflows: 1,
-            num_occupied: 6
-        })
+        assert_eq!(
+            stats,
+            Stats {
+                num_overflows: 1,
+                num_occupied: 6
+            }
+        )
     }
 
     #[test]
@@ -394,10 +397,13 @@ mod tests {
         }
 
         let stats = bucket.stats(&guard);
-        assert_eq!(stats, Stats {
-            num_overflows: 1,
-            num_occupied: 7
-        })
+        assert_eq!(
+            stats,
+            Stats {
+                num_overflows: 1,
+                num_occupied: 7
+            }
+        )
     }
 
     #[test]
