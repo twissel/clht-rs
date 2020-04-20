@@ -1,10 +1,11 @@
-use crate::bucket::{Bucket, BucketEntry, UpdateResult, WriteGuard, ENTRIES_PER_BUCKET};
+use crate::bucket::{Bucket, UpdateResult, WriteGuard, ENTRIES_PER_BUCKET};
 use crossbeam::epoch::*;
 use crossbeam::utils::Backoff;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::Ordering::*;
 
 const PERC_FULL_DOUBLE: f64 = 50.0;
+const OCCUP_AFTER_RESIZE: f64 = 40.0;
 const MAX_EXPANSIONS: usize = 24;
 const RAW_TABLE_STATE_QUIESCENCE: usize = 0;
 const RAW_TABLE_STATE_GROWING: usize = 1;
@@ -20,9 +21,21 @@ struct RawTable<K, V> {
     cap_log2: u32,
 }
 
+impl<K, V> RawTable<K, V> {
+    fn with_pow_buckets(pow: u32) -> Self {
+        let cap = 2usize.pow(pow);
+        let buckets = (0..cap).map(|_| Bucket::new()).collect::<Vec<_>>();
+        RawTable {
+            buckets: buckets.into_boxed_slice(),
+            cap_log2: pow,
+        }
+    }
+}
+
 impl<K, V> RawTable<K, V>
 where
-    K: Hash,
+    K: Hash + Eq + 'static,
+    V: 'static,
 {
     fn bucket_index(&self, hash: u64) -> usize {
         let index = hash >> (64 - self.cap_log2 as u64);
@@ -34,9 +47,49 @@ where
         unsafe { self.buckets.get_unchecked(index) }
     }
 
+    fn bucket_mut_for_hash(&mut self, hash: u64) -> &mut Bucket<K, V> {
+        let index = self.bucket_index(hash);
+        unsafe { self.buckets.get_unchecked_mut(index) }
+    }
+
     fn signature(&self, hash: u64) -> u8 {
         let sign = hash >> (64 - 8 - self.cap_log2 as u64) & ((1 << 8) - 1);
         sign as u8
+    }
+
+    fn stats(&self, guard: &Guard) -> Stats {
+        let mut num_occupied = 0;
+        let mut expands_max = 0;
+        for bucket in &*self.buckets {
+            let bucket_stats = bucket.stats(guard);
+            num_occupied += bucket_stats.num_occupied;
+            if bucket_stats.num_overflows > expands_max {
+                expands_max = bucket_stats.num_overflows;
+            }
+        }
+
+        Stats {
+            full_ratio: 100f64 * num_occupied as f64
+                / (self.buckets.len() * ENTRIES_PER_BUCKET) as f64,
+            expands_max,
+        }
+    }
+
+    fn transfer_bucket(&mut self, bucket: &WriteGuard<K, V>, guard: &Guard) {
+        for entry in bucket.entries_mut(guard) {
+            let pair_opt = entry.swap_with_null(guard);
+            unsafe {
+                match pair_opt.as_ref() {
+                    Some(pair) => {
+                        let key_hash = hash(&pair.0);
+                        let key_sign = self.signature(key_hash);
+                        let new_key_bucket = self.bucket_mut_for_hash(key_hash);
+                        new_key_bucket.transfer(pair_opt, key_sign);
+                    }
+                    None => {}
+                }
+            }
+        }
     }
 }
 
@@ -55,13 +108,8 @@ where
 
     pub fn with_pow_buckets(pow: u32) -> Self {
         assert!(pow > 0);
-        let cap = 2usize.pow(pow);
-        let buckets = (0..cap).map(|_| Bucket::new()).collect::<Vec<_>>();
         Self {
-            raw_ptr: Atomic::new(RawTable {
-                buckets: buckets.into_boxed_slice(),
-                cap_log2: pow,
-            }),
+            raw_ptr: Atomic::new(RawTable::with_pow_buckets(pow)),
         }
     }
 
@@ -71,7 +119,7 @@ where
         let ins_res = self.run_locked(
             key_hash,
             move |table_ptr, bucket, sign, g| {
-                (table_ptr, bucket.insert(BucketEntry { key, val, sign }, g))
+                (table_ptr, bucket.insert((key, val), sign, g))
             },
             guard,
         );
@@ -144,25 +192,17 @@ where
             ) {
                 Ok(raw_shared) => {
                     let raw_ref = unsafe { raw_shared.deref() };
-                    let mut num_occupied = 0;
-                    let mut expands_max = 0;
-                    for bucket in &*raw_ref.buckets {
-                        let bucket_stats = bucket.stats(guard);
-                        num_occupied += bucket_stats.num_occupied;
-                        if bucket_stats.num_overflows > expands_max {
-                            expands_max = bucket_stats.num_overflows;
-                        }
-                    }
-
-                    let stats = Stats {
-                        full_ratio: 100f64 * num_occupied as f64
-                            / (raw_ref.buckets.len() * ENTRIES_PER_BUCKET) as f64,
-                        expands_max,
-                    };
-
-                    let mut guards = Vec::new();
+                    let stats = raw_ref.stats(guard);
+                    //dbg!(&stats);
                     if stats.grow_needed() {
+                        /*let mut new_table = RawTable::with_pow_buckets(raw_ref.cap_log2 + 1);
+                        let mut guards = Vec::new();
 
+                        for bucket in &*raw_ref.buckets {
+                            let bucket_write = bucket.write();
+                            new_table.transfer_bucket(&bucket_write, guard);
+                            guards.push(bucket_write);
+                        }*/
                     } else {
                         self.raw_ptr
                             .store(raw_shared.with_tag(RAW_TABLE_STATE_QUIESCENCE), Release);
