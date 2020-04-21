@@ -1,12 +1,10 @@
-use crate::bucket::{Bucket, UpdateResult, WriteGuard, ENTRIES_PER_BUCKET};
+use crate::bucket::{Bucket, UpdateResult, WriteGuard};
 use crossbeam::epoch::*;
-use crossbeam::utils::Backoff;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::Ordering::*;
+use std::sync::atomic::{Ordering::*, *};
 
-const PERC_FULL_DOUBLE: f64 = 50.0;
-const OCCUP_AFTER_RESIZE: f64 = 40.0;
-const MAX_EXPANSIONS: usize = 24;
+//const PERC_FULL_DOUBLE: f64 = 80.0;
+//const MAX_EXPANSIONS: usize = 24;
 const RAW_TABLE_STATE_QUIESCENCE: usize = 0;
 const RAW_TABLE_STATE_GROWING: usize = 1;
 
@@ -19,6 +17,7 @@ fn hash<T: Hash>(data: T) -> u64 {
 struct RawTable<K, V> {
     buckets: Box<[Bucket<K, V>]>,
     cap_log2: u32,
+    num_overflows: AtomicUsize,
 }
 
 impl<K, V> RawTable<K, V> {
@@ -28,6 +27,7 @@ impl<K, V> RawTable<K, V> {
         RawTable {
             buckets: buckets.into_boxed_slice(),
             cap_log2: pow,
+            num_overflows: AtomicUsize::new(0),
         }
     }
 }
@@ -57,6 +57,7 @@ where
         sign as u8
     }
 
+    /*
     fn stats(&self, guard: &Guard) -> Stats {
         let mut num_occupied = 0;
         let mut expands_max = 0;
@@ -74,6 +75,7 @@ where
             expands_max,
         }
     }
+*/
 
     fn transfer_bucket(&mut self, bucket: &WriteGuard<K, V>, guard: &Guard) {
         for entry in bucket.entries_mut(guard) {
@@ -119,18 +121,27 @@ where
         let ins_res = self.run_locked(
             key_hash,
             move |table_ptr, bucket, sign, g| {
-                (table_ptr, bucket.insert((key, val), sign, g))
+                let ins_res = bucket.insert((key, val), sign, g);
+                match ins_res {
+                    UpdateResult::UpdatedWithOverflow => {
+                        unsafe { table_ptr.deref().num_overflows.fetch_add(1, Relaxed) };
+                        (table_ptr, None, true)
+                    }
+                    UpdateResult::Updated(old_pair) => {
+                        (table_ptr, old_pair.map(|pair| &pair.1), false)
+                    }
+                }
             },
             guard,
         );
-        let (table_ptr, ins_res) = ins_res;
-        match ins_res {
-            UpdateResult::UpdatedWithOverflow => {
-                self.try_grow(table_ptr, guard);
-                None
-            }
-            UpdateResult::Updated(old_pair) => old_pair.map(|pair| &pair.1),
+
+        let (table_ptr, old, overflowed) = ins_res;
+
+        if overflowed {
+            self.try_grow(table_ptr, guard);
         }
+
+        old
     }
 
     pub fn get<'g>(&self, key: &K, guard: &'g Guard) -> Option<&'g V> {
@@ -155,7 +166,6 @@ where
     where
         for<'a> F: FnOnce(Shared<'g, RawTable<K, V>>, WriteGuard<'a, K, V>, u8, &'g Guard) -> R,
     {
-        let backoff = Backoff::new();
         loop {
             let old_raw = self.raw_ptr.load(Acquire, guard);
             {
@@ -175,8 +185,7 @@ where
                     let key_sig = raw_ref.signature(key_hash);
                     return func(cur_raw, bucket_write, key_sig, guard);
                 }
-                // concurrent resize is going or table was resized, retry later
-                backoff.snooze();
+                // table was resized, try again
                 continue;
             }
         }
@@ -184,36 +193,41 @@ where
 
     fn try_grow<'g>(&self, raw_shared: Shared<'g, RawTable<K, V>>, guard: &'g Guard) {
         if raw_shared.tag() == RAW_TABLE_STATE_QUIESCENCE {
-            match self.raw_ptr.compare_and_set(
-                raw_shared,
-                raw_shared.with_tag(RAW_TABLE_STATE_GROWING),
-                Acquire,
-                guard,
-            ) {
-                Ok(raw_shared) => {
-                    let raw_ref = unsafe { raw_shared.deref() };
-                    let stats = raw_ref.stats(guard);
-                    //dbg!(&stats);
-                    if stats.grow_needed() {
-                        /*let mut new_table = RawTable::with_pow_buckets(raw_ref.cap_log2 + 1);
+            let grow_needed = unsafe {
+                let raw_ref = raw_shared.deref();
+                raw_ref.num_overflows.load(Relaxed) >= raw_ref.buckets.len()
+            };
+            if grow_needed {
+                match self.raw_ptr.compare_and_set(
+                    raw_shared,
+                    raw_shared.with_tag(RAW_TABLE_STATE_GROWING),
+                    Acquire,
+                    guard,
+                ) {
+                    Ok(raw_shared) => {
+                        let raw_ref = unsafe { raw_shared.deref() };
+                        let mut new_raw_table = RawTable::with_pow_buckets(raw_ref.cap_log2 + 1);
                         let mut guards = Vec::new();
 
                         for bucket in &*raw_ref.buckets {
                             let bucket_write = bucket.write();
-                            new_table.transfer_bucket(&bucket_write, guard);
+                            new_raw_table.transfer_bucket(&bucket_write, guard);
                             guards.push(bucket_write);
-                        }*/
-                    } else {
-                        self.raw_ptr
-                            .store(raw_shared.with_tag(RAW_TABLE_STATE_QUIESCENCE), Release);
+                        }
+                        self.raw_ptr.store(Owned::new(new_raw_table), Release);
+                        drop(guards);
+                        unsafe {
+                            guard.defer_destroy(raw_shared);
+                        }
                     }
+                    Err(_) => {}
                 }
-                Err(_) => {}
             }
         }
     }
 }
 
+/*
 #[derive(Default, Debug)]
 struct Stats {
     full_ratio: f64,
@@ -225,6 +239,7 @@ impl Stats {
         self.full_ratio > PERC_FULL_DOUBLE || self.expands_max > MAX_EXPANSIONS
     }
 }
+*/
 
 impl<K, V> Drop for HashMap<K, V> {
     fn drop(&mut self) {

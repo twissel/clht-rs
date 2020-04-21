@@ -4,6 +4,7 @@ use crossbeam::epoch;
 use rayon;
 use rayon::prelude::*;
 use std::sync::Arc;
+use std::sync::atomic::Ordering::Relaxed;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -70,7 +71,10 @@ fn insert_u64_u64(c: &mut Criterion) {
                 pool.install(|| {
                     b.iter_batched(
                         || Arc::new(HashMap::with_pow_buckets(12)),
-                        |map| task_insert_u64_u64_same_map(map, threads),
+                        |map| {
+                            let m = task_insert_u64_u64_same_map(map, threads);
+                            m
+                        },
                         BatchSize::SmallInput,
                     )
                 });
@@ -123,5 +127,5 @@ fn get_u64_u64(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, insert_u64_u64, get_u64_u64);
+criterion_group!(benches, insert_u64_u64);
 criterion_main!(benches);

@@ -1,6 +1,6 @@
-use crate::lock::{Mutex, MutexGuard};
+//use crate::lock::{Mutex, MutexGuard};
+use parking_lot::{Mutex, MutexGuard};
 use crossbeam::epoch::*;
-use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::{
     AtomicU8,
     Ordering::{Acquire, Release},
@@ -111,17 +111,17 @@ where
 
 #[repr(C)]
 pub struct Bucket<K, V> {
-    lock: Mutex,
-    signatures: [AtomicU8; 5],
+    lock: Mutex<()>,
+    signatures: [AtomicU8; ENTRIES_PER_BUCKET],
     _pad: u64,
-    cells: [Atomic<(K, V)>; 5],
+    cells: [Atomic<(K, V)>; ENTRIES_PER_BUCKET],
     next: Atomic<Bucket<K, V>>,
 }
 
 impl<K, V> Bucket<K, V> {
     pub fn new() -> Self {
         Self {
-            lock: Mutex::new(),
+            lock: Mutex::new(()),
             cells: [
                 Atomic::null(),
                 Atomic::null(),
@@ -196,8 +196,7 @@ where
         let mut cur_bucket = Some(self);
         while let Some(bucket) = cur_bucket {
             for cell in &bucket.cells {
-                // as we don't touch cell data, we can use relaxed ordering here
-                let pair = cell.load(Relaxed, guard);
+                let pair = cell.load(Acquire, guard);
                 if !pair.is_null() {
                     stats.num_occupied += 1;
                 }
@@ -279,7 +278,7 @@ impl<K, V> Drop for Bucket<K, V> {
 }
 
 pub struct WriteGuard<'a, K, V> {
-    _guard: MutexGuard<'a>,
+    _guard: MutexGuard<'a, ()>,
     bucket: &'a Bucket<K, V>,
 }
 
