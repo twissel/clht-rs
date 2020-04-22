@@ -3,8 +3,6 @@ use crossbeam::epoch::*;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{Ordering::*, *};
 
-//const PERC_FULL_DOUBLE: f64 = 80.0;
-//const MAX_EXPANSIONS: usize = 24;
 const RAW_TABLE_STATE_QUIESCENCE: usize = 0;
 const RAW_TABLE_STATE_GROWING: usize = 1;
 
@@ -56,26 +54,6 @@ where
         let sign = hash >> (64 - 8 - self.cap_log2 as u64) & ((1 << 8) - 1);
         sign as u8
     }
-
-    /*
-    fn stats(&self, guard: &Guard) -> Stats {
-        let mut num_occupied = 0;
-        let mut expands_max = 0;
-        for bucket in &*self.buckets {
-            let bucket_stats = bucket.stats(guard);
-            num_occupied += bucket_stats.num_occupied;
-            if bucket_stats.num_overflows > expands_max {
-                expands_max = bucket_stats.num_overflows;
-            }
-        }
-
-        Stats {
-            full_ratio: 100f64 * num_occupied as f64
-                / (self.buckets.len() * ENTRIES_PER_BUCKET) as f64,
-            expands_max,
-        }
-    }
-*/
 
     fn transfer_bucket(&mut self, bucket: &WriteGuard<K, V>, guard: &Guard) {
         for entry in bucket.entries_mut(guard) {
@@ -226,20 +204,6 @@ where
         }
     }
 }
-
-/*
-#[derive(Default, Debug)]
-struct Stats {
-    full_ratio: f64,
-    expands_max: usize,
-}
-
-impl Stats {
-    fn grow_needed(&self) -> bool {
-        self.full_ratio > PERC_FULL_DOUBLE || self.expands_max > MAX_EXPANSIONS
-    }
-}
-*/
 
 impl<K, V> Drop for HashMap<K, V> {
     fn drop(&mut self) {
