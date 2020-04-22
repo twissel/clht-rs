@@ -190,29 +190,6 @@ where
         }
     }
 
-    pub fn stats(&self, guard: &Guard) -> Stats {
-        let mut stats = Stats::default();
-
-        let mut cur_bucket = Some(self);
-        while let Some(bucket) = cur_bucket {
-            for cell in &bucket.cells {
-                let pair = cell.load(Acquire, guard);
-                if !pair.is_null() {
-                    stats.num_occupied += 1;
-                }
-            }
-
-            let next_bucket = bucket.next.load(Acquire, guard);
-            if !next_bucket.is_null() {
-                stats.num_overflows += 1;
-            }
-
-            // safe as we used Acquire on bucket load
-            cur_bucket = unsafe { next_bucket.as_ref() };
-        }
-        stats
-    }
-
     pub unsafe fn entries_mut(&self) -> RawBucketEntryRefIter<K, V, Mut_> {
         RawBucketEntryRefIter {
             bucket: self,
@@ -244,12 +221,6 @@ where
         entry_ref.store(Pair::Shared { pair, sign });
         last_bucket.next.store(Owned::new(new_bucket), Release);
     }
-}
-
-#[derive(Default, Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Stats {
-    pub num_overflows: usize,
-    pub num_occupied: usize,
 }
 
 impl<K, V> Bucket<K, V> {
@@ -402,15 +373,6 @@ mod tests {
         for pair in pairs.iter() {
             assert_eq!(bucket.find(&pair.0, 0, &guard), Some(&pair.1));
         }
-
-        let stats = bucket.stats(&guard);
-        assert_eq!(
-            stats,
-            Stats {
-                num_overflows: 1,
-                num_occupied: 6
-            }
-        )
     }
 
     #[test]
@@ -430,15 +392,6 @@ mod tests {
         for pair in pairs.iter() {
             assert_eq!(bucket.find(&pair.0, 0, &guard), Some(&pair.1));
         }
-
-        let stats = bucket.stats(&guard);
-        assert_eq!(
-            stats,
-            Stats {
-                num_overflows: 1,
-                num_occupied: 7
-            }
-        )
     }
 
     #[test]
