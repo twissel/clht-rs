@@ -1,5 +1,4 @@
 mod bucket;
-mod lock;
 mod map;
 
 pub use crate::map::HashMap;
