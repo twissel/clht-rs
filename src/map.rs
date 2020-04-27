@@ -1,12 +1,13 @@
 use crate::bucket::{Bucket, InsertResult, WriteGuard};
 use crossbeam::epoch::*;
+use std::borrow::Borrow;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::atomic::{Ordering::*, *};
 
 const RAW_TABLE_STATE_QUIESCENCE: usize = 0;
 const RAW_TABLE_STATE_GROWING: usize = 1;
 
-fn hash<K: Hash, S: BuildHasher>(key: &K, build_hasher: &S) -> u64 {
+fn hash<K: Hash + ?Sized, S: BuildHasher>(key: &K, build_hasher: &S) -> u64 {
     let mut hasher = build_hasher.build_hasher();
     key.hash(&mut hasher);
     hasher.finish()
@@ -119,7 +120,7 @@ where
     V: 'static + Send + Sync,
     S: BuildHasher,
 {
-    fn hash(&self, key: &K) -> u64 {
+    fn hash<Q: ?Sized + Hash>(&self, key: &Q) -> u64 {
         hash(key, &self.build_hasher)
     }
 
@@ -152,7 +153,11 @@ where
         old
     }
 
-    pub fn get<'g>(&self, key: &K, guard: &'g Guard) -> Option<&'g V> {
+    pub fn get<'g, Q>(&self, key: &Q, guard: &'g Guard) -> Option<&'g V>
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + Hash + Eq,
+    {
         let key_hash = self.hash(key);
         let raw_ref = unsafe { self.raw_ptr.load(Acquire, guard).deref() };
         let bucket = raw_ref.bucket_for_hash(key_hash);
@@ -160,7 +165,11 @@ where
         bucket.find(key, sign, guard)
     }
 
-    pub fn remove<'g>(&self, key: &K, guard: &'g Guard) -> Option<&'g V> {
+    pub fn remove<'g, Q>(&self, key: &Q, guard: &'g Guard) -> Option<&'g V>
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + Hash + Eq,
+    {
         let key_hash = self.hash(&key);
 
         self.run_locked(

@@ -1,5 +1,7 @@
 use crossbeam::epoch::*;
 use parking_lot::{Mutex, MutexGuard};
+use std::borrow::Borrow;
+use std::hash::Hash;
 use std::sync::atomic::{
     AtomicU8,
     Ordering::{Acquire, Release},
@@ -155,7 +157,11 @@ where
         }
     }
 
-    pub fn find<'g>(&self, key: &K, signature: u8, guard: &'g Guard) -> Option<&'g V> {
+    pub fn find<'g, Q>(&self, key: &Q, signature: u8, guard: &'g Guard) -> Option<&'g V>
+    where
+        Q: ?Sized + Hash + Eq,
+        K: Borrow<Q>,
+    {
         self.entries(guard).find_map(|entry| {
             let cell_signature = entry.load_sign();
             if cell_signature == signature {
@@ -163,7 +169,7 @@ where
                 let cell_ref = unsafe { cell.as_ref() };
                 match cell_ref {
                     Some(cell_ref) => {
-                        if *key == cell_ref.0 {
+                        if key == cell_ref.0.borrow() {
                             Some(&cell_ref.1)
                         } else {
                             None
@@ -306,7 +312,11 @@ where
         }
     }
 
-    pub fn remove<'g>(&self, key: &K, key_sign: u8, guard: &'g Guard) -> Option<&'g V> {
+    pub fn remove<'g, Q>(&self, key: &Q, key_sign: u8, guard: &'g Guard) -> Option<&'g V>
+    where
+        Q: ?Sized + Hash + Eq,
+        K: Borrow<Q>,
+    {
         for entry in self.entries_mut(guard) {
             let cell = entry.load_kv(guard);
             let cell_ref = unsafe { cell.as_ref() };
@@ -314,7 +324,7 @@ where
             match cell_ref {
                 Some(cell_ref) => {
                     let entry_sign = entry.load_sign();
-                    if entry_sign == key_sign && cell_ref.0 == *key {
+                    if entry_sign == key_sign && cell_ref.0.borrow() == key {
                         entry.clear();
                         unsafe {
                             guard.defer_destroy(cell);
@@ -360,7 +370,10 @@ mod tests {
             if idx < 5 {
                 assert_eq!(w.insert(pair, 0, &guard), InsertResult::Inserted(None));
             } else {
-                assert_eq!(w.insert(pair, 0, &guard), InsertResult::InsertedWithOverflow);
+                assert_eq!(
+                    w.insert(pair, 0, &guard),
+                    InsertResult::InsertedWithOverflow
+                );
             }
         }
 
@@ -379,7 +392,10 @@ mod tests {
             if idx != 5 {
                 assert_eq!(w.insert(pair, 0, &guard), InsertResult::Inserted(None));
             } else {
-                assert_eq!(w.insert(pair, 0, &guard), InsertResult::InsertedWithOverflow);
+                assert_eq!(
+                    w.insert(pair, 0, &guard),
+                    InsertResult::InsertedWithOverflow
+                );
             }
         }
 
