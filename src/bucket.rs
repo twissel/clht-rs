@@ -1,6 +1,5 @@
-//use crate::lock::{Mutex, MutexGuard};
-use parking_lot::{Mutex, MutexGuard};
 use crossbeam::epoch::*;
+use parking_lot::{Mutex, MutexGuard};
 use std::sync::atomic::{
     AtomicU8,
     Ordering::{Acquire, Release},
@@ -164,12 +163,8 @@ where
                 let cell_ref = unsafe { cell.as_ref() };
                 match cell_ref {
                     Some(cell_ref) => {
-                        if cell_signature == signature {
-                            if *key == cell_ref.0 {
-                                Some(&cell_ref.1)
-                            } else {
-                                None
-                            }
+                        if *key == cell_ref.0 {
+                            Some(&cell_ref.1)
                         } else {
                             None
                         }
@@ -263,14 +258,13 @@ where
         pair: (K, V),
         pair_sign: u8,
         guard: &'g Guard,
-    ) -> UpdateResult<'g, K, V> {
+    ) -> InsertResult<'g, K, V> {
         let mut empty_entry = None;
         let mut last_bucket = self.bucket;
         for entry in self.entries_mut(guard) {
             last_bucket = entry.bucket;
             let cell = entry.load_kv(guard);
             let cell_ref = unsafe { cell.as_ref() };
-
             match cell_ref {
                 Some(cell_ref) => {
                     let sign = entry.load_sign();
@@ -279,7 +273,7 @@ where
                         unsafe {
                             guard.defer_destroy(cell);
                         }
-                        return UpdateResult::Updated(Some(cell_ref));
+                        return InsertResult::Inserted(Some(cell_ref));
                     }
                 }
                 None => {
@@ -296,7 +290,7 @@ where
                     pair,
                     sign: pair_sign,
                 });
-                UpdateResult::Updated(None)
+                InsertResult::Inserted(None)
             }
             None => {
                 let new_bucket = Bucket::new();
@@ -307,7 +301,7 @@ where
                     sign: pair_sign,
                 });
                 last_bucket.next.store(Owned::new(new_bucket), Release);
-                UpdateResult::UpdatedWithOverflow
+                InsertResult::InsertedWithOverflow
             }
         }
     }
@@ -347,9 +341,9 @@ where
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub enum UpdateResult<'g, K, V> {
-    Updated(Option<&'g (K, V)>),
-    UpdatedWithOverflow,
+pub enum InsertResult<'g, K, V> {
+    Inserted(Option<&'g (K, V)>),
+    InsertedWithOverflow,
 }
 
 #[cfg(test)]
@@ -364,9 +358,9 @@ mod tests {
         for (idx, pair) in pairs.iter().copied().enumerate() {
             let w = bucket.write();
             if idx < 5 {
-                assert_eq!(w.insert(pair, 0, &guard), UpdateResult::Updated(None));
+                assert_eq!(w.insert(pair, 0, &guard), InsertResult::Inserted(None));
             } else {
-                assert_eq!(w.insert(pair, 0, &guard), UpdateResult::UpdatedWithOverflow);
+                assert_eq!(w.insert(pair, 0, &guard), InsertResult::InsertedWithOverflow);
             }
         }
 
@@ -383,9 +377,9 @@ mod tests {
         for (idx, pair) in pairs.iter().copied().enumerate() {
             let w = bucket.write();
             if idx != 5 {
-                assert_eq!(w.insert(pair, 0, &guard), UpdateResult::Updated(None));
+                assert_eq!(w.insert(pair, 0, &guard), InsertResult::Inserted(None));
             } else {
-                assert_eq!(w.insert(pair, 0, &guard), UpdateResult::UpdatedWithOverflow);
+                assert_eq!(w.insert(pair, 0, &guard), InsertResult::InsertedWithOverflow);
             }
         }
 

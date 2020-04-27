@@ -9,9 +9,6 @@ use std::sync::atomic::Ordering::Relaxed;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-//#[global_allocator]
-//static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
-
 const ITER: u64 = 32 * 1024;
 
 fn task_insert_u64_u64(threads: usize) -> HashMap<u64, u64> {
@@ -127,5 +124,5 @@ fn get_u64_u64(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, insert_u64_u64);
+criterion_group!(benches, insert_u64_u64, get_u64_u64);
 criterion_main!(benches);

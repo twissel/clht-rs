@@ -1,14 +1,14 @@
-use crate::bucket::{Bucket, UpdateResult, WriteGuard};
+use crate::bucket::{Bucket, InsertResult, WriteGuard};
 use crossbeam::epoch::*;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::atomic::{Ordering::*, *};
 
 const RAW_TABLE_STATE_QUIESCENCE: usize = 0;
 const RAW_TABLE_STATE_GROWING: usize = 1;
 
-fn hash<T: Hash>(data: T) -> u64 {
-    let mut hasher = ahash::AHasher::default();
-    data.hash(&mut hasher);
+fn hash<K: Hash, S: BuildHasher>(key: &K, build_hasher: &S) -> u64 {
+    let mut hasher = build_hasher.build_hasher();
+    key.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -55,57 +55,87 @@ where
         sign as u8
     }
 
-    fn transfer_bucket(&mut self, bucket: &WriteGuard<K, V>, guard: &Guard) {
+    fn transfer_bucket<S: BuildHasher>(
+        &mut self,
+        build_hasher: &S,
+        bucket: &WriteGuard<K, V>,
+        guard: &Guard,
+    ) {
         for entry in bucket.entries_mut(guard) {
             let pair_opt = entry.swap_with_null(guard);
             unsafe {
-                match pair_opt.as_ref() {
-                    Some(pair) => {
-                        let key_hash = hash(&pair.0);
-                        let key_sign = self.signature(key_hash);
-                        let new_key_bucket = self.bucket_mut_for_hash(key_hash);
-                        new_key_bucket.transfer(pair_opt, key_sign);
-                    }
-                    None => {}
+                if let Some(pair) = pair_opt.as_ref() {
+                    let key_hash = hash(&pair.0, build_hasher);
+                    let key_sign = self.signature(key_hash);
+                    let new_key_bucket = self.bucket_mut_for_hash(key_hash);
+                    new_key_bucket.transfer(pair_opt, key_sign);
                 }
             }
         }
     }
 }
 
-pub struct HashMap<K, V> {
+pub struct HashMap<K, V, S = crate::DefaultHashBuilder> {
     raw_ptr: Atomic<RawTable<K, V>>,
+    build_hasher: S,
 }
 
-impl<K, V> HashMap<K, V>
-where
-    K: Eq + Hash + 'static + Send,
-    V: 'static + Send,
-{
+impl<K, V> HashMap<K, V, crate::DefaultHashBuilder> {
     pub fn new() -> Self {
-        Self::with_pow_buckets(2)
+        Self::default()
     }
 
     pub fn with_pow_buckets(pow: u32) -> Self {
+        Self::with_pow_buckets_and_hasher(pow, crate::DefaultHashBuilder::default())
+    }
+}
+
+impl<K, V, S> HashMap<K, V, S> {
+    pub fn with_hasher(hash_builder: S) -> Self {
+        Self::with_pow_buckets_and_hasher(2, hash_builder)
+    }
+
+    pub fn with_pow_buckets_and_hasher(pow: u32, build_hasher: S) -> Self {
         assert!(pow > 0);
         Self {
             raw_ptr: Atomic::new(RawTable::with_pow_buckets(pow)),
+            build_hasher,
         }
+    }
+}
+
+impl<K, V, S> Default for HashMap<K, V, S>
+where
+    S: Default,
+{
+    fn default() -> Self {
+        Self::with_hasher(S::default())
+    }
+}
+
+impl<K, V, S> HashMap<K, V, S>
+where
+    K: Eq + Hash + 'static + Send + Sync,
+    V: 'static + Send + Sync,
+    S: BuildHasher,
+{
+    fn hash(&self, key: &K) -> u64 {
+        hash(key, &self.build_hasher)
     }
 
     pub fn insert<'g>(&self, key: K, val: V, guard: &'g Guard) -> Option<&'g V> {
-        let key_hash = hash(&key);
+        let key_hash = self.hash(&key);
 
         let ins_res = self.run_locked(
             key_hash,
             move |table_ptr, bucket, sign, g| {
                 let ins_res = bucket.insert((key, val), sign, g);
                 match ins_res {
-                    UpdateResult::UpdatedWithOverflow => {
+                    InsertResult::InsertedWithOverflow => {
                         unsafe { table_ptr.deref().num_overflows.fetch_add(1, Relaxed) };
                         (table_ptr, None, true)
                     }
-                    UpdateResult::Updated(old_pair) => {
+                    InsertResult::Inserted(old_pair) => {
                         (table_ptr, old_pair.map(|pair| &pair.1), false)
                     }
                 }
@@ -123,7 +153,7 @@ where
     }
 
     pub fn get<'g>(&self, key: &K, guard: &'g Guard) -> Option<&'g V> {
-        let key_hash = hash(key);
+        let key_hash = self.hash(key);
         let raw_ref = unsafe { self.raw_ptr.load(Acquire, guard).deref() };
         let bucket = raw_ref.bucket_for_hash(key_hash);
         let sign = raw_ref.signature(key_hash);
@@ -131,7 +161,7 @@ where
     }
 
     pub fn remove<'g>(&self, key: &K, guard: &'g Guard) -> Option<&'g V> {
-        let key_hash = hash(&key);
+        let key_hash = self.hash(&key);
 
         self.run_locked(
             key_hash,
@@ -176,36 +206,33 @@ where
                 raw_ref.num_overflows.load(Relaxed) >= raw_ref.buckets.len()
             };
             if grow_needed {
-                match self.raw_ptr.compare_and_set(
+                if let Ok(raw_shared) = self.raw_ptr.compare_and_set(
                     raw_shared,
                     raw_shared.with_tag(RAW_TABLE_STATE_GROWING),
                     Acquire,
                     guard,
                 ) {
-                    Ok(raw_shared) => {
-                        let raw_ref = unsafe { raw_shared.deref() };
-                        let mut new_raw_table = RawTable::with_pow_buckets(raw_ref.cap_log2 + 1);
-                        let mut guards = Vec::new();
+                    let raw_ref = unsafe { raw_shared.deref() };
+                    let mut new_raw_table = RawTable::with_pow_buckets(raw_ref.cap_log2 + 1);
+                    let mut guards = Vec::new();
 
-                        for bucket in &*raw_ref.buckets {
-                            let bucket_write = bucket.write();
-                            new_raw_table.transfer_bucket(&bucket_write, guard);
-                            guards.push(bucket_write);
-                        }
-                        self.raw_ptr.store(Owned::new(new_raw_table), Release);
-                        drop(guards);
-                        unsafe {
-                            guard.defer_destroy(raw_shared);
-                        }
+                    for bucket in &*raw_ref.buckets {
+                        let bucket_write = bucket.write();
+                        new_raw_table.transfer_bucket(&self.build_hasher, &bucket_write, guard);
+                        guards.push(bucket_write);
                     }
-                    Err(_) => {}
+                    self.raw_ptr.store(Owned::new(new_raw_table), Release);
+                    drop(guards);
+                    unsafe {
+                        guard.defer_destroy(raw_shared);
+                    }
                 }
             }
         }
     }
 }
 
-impl<K, V> Drop for HashMap<K, V> {
+impl<K, V, S> Drop for HashMap<K, V, S> {
     fn drop(&mut self) {
         unsafe {
             // TODO: use Relaxed in all drops
@@ -215,7 +242,7 @@ impl<K, V> Drop for HashMap<K, V> {
     }
 }
 
-impl<K, V> std::fmt::Debug for HashMap<K, V> {
+impl<K, V, S> std::fmt::Debug for HashMap<K, V, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "clht_rs")
     }
