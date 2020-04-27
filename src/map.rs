@@ -158,6 +158,14 @@ where
         K: Borrow<Q>,
         Q: ?Sized + Hash + Eq,
     {
+        self.get_key_value(key, guard).map(|(_, val)| val)
+    }
+
+    pub fn get_key_value<'g, Q>(&self, key: &Q, guard: &'g Guard) -> Option<(&'g K, &'g V)>
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + Hash + Eq,
+    {
         let key_hash = self.hash(key);
         let raw_ref = unsafe { self.raw_ptr.load(Acquire, guard).deref() };
         let bucket = raw_ref.bucket_for_hash(key_hash);
@@ -165,7 +173,15 @@ where
         bucket.find(key, sign, guard)
     }
 
-    pub fn remove<'g, Q>(&self, key: &Q, guard: &'g Guard) -> Option<&'g V>
+    pub fn contains_key<'g, Q>(&self, key: &Q, guard: &'g Guard) -> bool
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + Hash + Eq,
+    {
+        self.get_key_value(key, guard).is_some()
+    }
+
+    pub fn remove_entry<'g, Q>(&self, key: &Q, guard: &'g Guard) -> Option<(&'g K, &'g V)>
     where
         K: Borrow<Q>,
         Q: ?Sized + Hash + Eq,
@@ -174,10 +190,18 @@ where
 
         self.run_locked(
             key_hash,
-            move |_, bucket, sign, g| bucket.remove(&key, sign, g),
+            move |_, bucket, sign, g| bucket.remove_entry(&key, sign, g),
             guard,
         )
     }
+    pub fn remove<'g, Q>(&self, key: &Q, guard: &'g Guard) -> Option<&'g V>
+        where
+            K: Borrow<Q>,
+            Q: ?Sized + Hash + Eq,
+    {
+        self.remove_entry(key, guard).map(|(_, val)| val)
+    }
+
 
     fn run_locked<'g, F, R: 'g>(&self, key_hash: u64, func: F, guard: &'g Guard) -> R
     where

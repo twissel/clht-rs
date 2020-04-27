@@ -21,24 +21,24 @@ pub struct Mut_;
 pub struct Shared_;
 
 #[derive(Clone, Copy)]
-pub struct RawBucketEntryRef<'a, K, V, M> {
+pub struct EntryRef<'a, K, V, M> {
     cell: &'a Atomic<(K, V)>,
     signature: &'a AtomicU8,
     bucket: &'a Bucket<K, V>,
     _mut_mark: M,
 }
 
-impl<'a, K, V, M> RawBucketEntryRef<'a, K, V, M> {
-    fn load_sign(&self) -> u8 {
+impl<'a, K, V, M> EntryRef<'a, K, V, M> {
+    fn load_signature(&self) -> u8 {
         self.signature.load(Acquire)
     }
 
-    fn load_kv<'g>(&self, guard: &'g Guard) -> Shared<'g, (K, V)> {
+    fn load_key_value<'g>(&self, guard: &'g Guard) -> Shared<'g, (K, V)> {
         self.cell.load(Acquire, guard)
     }
 }
 
-impl<'a, K, V> RawBucketEntryRef<'a, K, V, Mut_> {
+impl<'a, K, V> EntryRef<'a, K, V, Mut_> {
     fn store(&self, pair: Pair<K, V>) {
         match pair {
             Pair::Owned { pair, sign } => {
@@ -64,18 +64,18 @@ impl<'a, K, V> RawBucketEntryRef<'a, K, V, Mut_> {
     }
 }
 
-pub struct RawBucketEntryRefIter<'g, K, V, M> {
+pub struct EntryRefIter<'g, K, V, M> {
     bucket: &'g Bucket<K, V>,
     curr_entry_idx: usize,
     guard: &'g Guard,
     mut_mark: M,
 }
 
-impl<'g, K, V, M> Iterator for RawBucketEntryRefIter<'g, K, V, M>
+impl<'g, K, V, M> Iterator for EntryRefIter<'g, K, V, M>
 where
     M: Copy,
 {
-    type Item = RawBucketEntryRef<'g, K, V, M>;
+    type Item = EntryRef<'g, K, V, M>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -85,7 +85,7 @@ where
                     let cell = self.bucket.cells.get_unchecked(self.curr_entry_idx);
                     let signature = self.bucket.signatures.get_unchecked(self.curr_entry_idx);
                     self.curr_entry_idx += 1;
-                    return Some(RawBucketEntryRef {
+                    return Some(EntryRef {
                         cell,
                         signature,
                         bucket: self.bucket,
@@ -148,8 +148,8 @@ where
     K: Eq + 'static,
     V: 'static,
 {
-    pub fn entries<'g>(&'g self, guard: &'g Guard) -> RawBucketEntryRefIter<'g, K, V, Shared_> {
-        RawBucketEntryRefIter {
+    pub fn entries<'g>(&'g self, guard: &'g Guard) -> EntryRefIter<'g, K, V, Shared_> {
+        EntryRefIter {
             bucket: self,
             curr_entry_idx: 0,
             guard,
@@ -157,20 +157,20 @@ where
         }
     }
 
-    pub fn find<'g, Q>(&self, key: &Q, signature: u8, guard: &'g Guard) -> Option<&'g V>
+    pub fn find<'g, Q>(&self, key: &Q, signature: u8, guard: &'g Guard) -> Option<(&'g K, &'g V)>
     where
         Q: ?Sized + Hash + Eq,
         K: Borrow<Q>,
     {
         self.entries(guard).find_map(|entry| {
-            let cell_signature = entry.load_sign();
+            let cell_signature = entry.load_signature();
             if cell_signature == signature {
-                let cell = entry.load_kv(guard);
+                let cell = entry.load_key_value(guard);
                 let cell_ref = unsafe { cell.as_ref() };
                 match cell_ref {
                     Some(cell_ref) => {
                         if key == cell_ref.0.borrow() {
-                            Some(&cell_ref.1)
+                            Some((&cell_ref.0, &cell_ref.1))
                         } else {
                             None
                         }
@@ -191,8 +191,8 @@ where
         }
     }
 
-    pub unsafe fn entries_mut(&self) -> RawBucketEntryRefIter<K, V, Mut_> {
-        RawBucketEntryRefIter {
+    pub unsafe fn entries_mut(&self) -> EntryRefIter<K, V, Mut_> {
+        EntryRefIter {
             bucket: self,
             curr_entry_idx: 0,
             guard: unprotected(),
@@ -205,7 +205,7 @@ where
         let entries = unsafe { self.entries_mut() };
         for entry_ref in entries {
             last_bucket = entry_ref.bucket;
-            let cell = entry_ref.load_kv(unsafe { unprotected() });
+            let cell = entry_ref.load_key_value(unsafe { unprotected() });
             let cell_ref = unsafe { cell.as_ref() };
 
             match cell_ref {
@@ -269,11 +269,11 @@ where
         let mut last_bucket = self.bucket;
         for entry in self.entries_mut(guard) {
             last_bucket = entry.bucket;
-            let cell = entry.load_kv(guard);
+            let cell = entry.load_key_value(guard);
             let cell_ref = unsafe { cell.as_ref() };
             match cell_ref {
                 Some(cell_ref) => {
-                    let sign = entry.load_sign();
+                    let sign = entry.load_signature();
                     if sign == pair_sign && cell_ref.0 == pair.0 {
                         entry.store(Pair::Owned { pair, sign });
                         unsafe {
@@ -312,24 +312,29 @@ where
         }
     }
 
-    pub fn remove<'g, Q>(&self, key: &Q, key_sign: u8, guard: &'g Guard) -> Option<&'g V>
+    pub fn remove_entry<'g, Q>(
+        &self,
+        key: &Q,
+        key_sign: u8,
+        guard: &'g Guard,
+    ) -> Option<(&'g K, &'g V)>
     where
         Q: ?Sized + Hash + Eq,
         K: Borrow<Q>,
     {
         for entry in self.entries_mut(guard) {
-            let cell = entry.load_kv(guard);
+            let cell = entry.load_key_value(guard);
             let cell_ref = unsafe { cell.as_ref() };
 
             match cell_ref {
                 Some(cell_ref) => {
-                    let entry_sign = entry.load_sign();
+                    let entry_sign = entry.load_signature();
                     if entry_sign == key_sign && cell_ref.0.borrow() == key {
                         entry.clear();
                         unsafe {
                             guard.defer_destroy(cell);
                         }
-                        return Some(&cell_ref.1);
+                        return Some((&cell_ref.0, &cell_ref.1));
                     }
                 }
                 None => {
@@ -340,8 +345,8 @@ where
         None
     }
 
-    pub fn entries_mut(&self, guard: &'a Guard) -> RawBucketEntryRefIter<'a, K, V, Mut_> {
-        RawBucketEntryRefIter {
+    pub fn entries_mut(&self, guard: &'a Guard) -> EntryRefIter<'a, K, V, Mut_> {
+        EntryRefIter {
             bucket: self.bucket,
             curr_entry_idx: 0,
             guard,
@@ -378,7 +383,7 @@ mod tests {
         }
 
         for pair in pairs.iter() {
-            assert_eq!(bucket.find(&pair.0, 0, &guard), Some(&pair.1));
+            assert_eq!(bucket.find(&pair.0, 0, &guard), Some((&pair.0, &pair.1)));
         }
     }
 
@@ -400,7 +405,7 @@ mod tests {
         }
 
         for pair in pairs.iter() {
-            assert_eq!(bucket.find(&pair.0, 0, &guard), Some(&pair.1));
+            assert_eq!(bucket.find(&pair.0, 0, &guard), Some((&pair.0, &pair.1)));
         }
     }
 
@@ -415,7 +420,7 @@ mod tests {
         }
 
         for pair in pairs.iter() {
-            assert_eq!(bucket.find(&pair.0, 0, &guard), Some(&pair.1));
+            assert_eq!(bucket.find(&pair.0, 0, &guard), Some((&pair.0, &pair.1)));
         }
     }
 }

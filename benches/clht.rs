@@ -2,9 +2,7 @@ use clht_rs::HashMap;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use crossbeam::epoch;
 use rayon;
-use rayon::prelude::*;
 use std::sync::Arc;
-use std::sync::atomic::Ordering::Relaxed;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
