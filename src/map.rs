@@ -210,9 +210,7 @@ where
         loop {
             let old_raw = self.raw_ptr.load(Acquire, guard);
             {
-                // at least at line above table was not in growing state,
-                // try to find and lock bucket for insert
-
+                // find and lock bucket for insert
                 let raw_ref = unsafe { old_raw.deref() };
                 let bucket = raw_ref.bucket_for_hash(key_hash);
                 let bucket_write = bucket.write();
