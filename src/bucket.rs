@@ -2,10 +2,12 @@ use crossbeam::epoch::*;
 use parking_lot::{Mutex, MutexGuard};
 use std::borrow::Borrow;
 use std::hash::Hash;
+use std::marker::PhantomData;
 use std::sync::atomic::{
     AtomicU8,
     Ordering::{Acquire, Release},
 };
+use std::ops::AddAssign;
 
 pub const ENTRIES_PER_BUCKET: usize = 5;
 
@@ -25,7 +27,7 @@ pub struct EntryRef<'a, K, V, M> {
     cell: &'a Atomic<(K, V)>,
     signature: &'a AtomicU8,
     bucket: &'a Bucket<K, V>,
-    _mut_mark: M,
+    _mut_mark: PhantomData<M>,
 }
 
 impl<'a, K, V, M> EntryRef<'a, K, V, M> {
@@ -68,7 +70,7 @@ pub struct EntryRefIter<'g, K, V, M> {
     bucket: &'g Bucket<K, V>,
     curr_entry_idx: usize,
     guard: &'g Guard,
-    mut_mark: M,
+    mut_mark: PhantomData<M>,
 }
 
 impl<'g, K, V, M> Iterator for EntryRefIter<'g, K, V, M>
@@ -89,7 +91,7 @@ where
                         cell,
                         signature,
                         bucket: self.bucket,
-                        _mut_mark: self.mut_mark,
+                        _mut_mark: PhantomData,
                     });
                 }
             } else {
@@ -112,10 +114,14 @@ where
 
 #[repr(C)]
 pub struct Bucket<K, V> {
+    // 1 byte
     lock: Mutex<()>,
+    // 5 bytes
     signatures: [AtomicU8; ENTRIES_PER_BUCKET],
     _pad: u64,
+    // 40 bytes
     cells: [Atomic<(K, V)>; ENTRIES_PER_BUCKET],
+    // 8 bytes
     next: Atomic<Bucket<K, V>>,
 }
 
@@ -145,7 +151,7 @@ impl<K, V> Bucket<K, V> {
 
 impl<K, V> Bucket<K, V>
 where
-    K: Eq + 'static,
+    K: 'static,
     V: 'static,
 {
     pub fn entries<'g>(&'g self, guard: &'g Guard) -> EntryRefIter<'g, K, V, Shared_> {
@@ -153,7 +159,7 @@ where
             bucket: self,
             curr_entry_idx: 0,
             guard,
-            mut_mark: Shared_,
+            mut_mark: PhantomData,
         }
     }
 
@@ -162,7 +168,9 @@ where
         Q: ?Sized + Hash + Eq,
         K: Borrow<Q>,
     {
+        //let mut num_entries_to_find = 0;
         self.entries(guard).find_map(|entry| {
+            //num_entries_to_find += 1;
             let cell_signature = entry.load_signature();
             if cell_signature == signature {
                 let cell = entry.load_key_value(guard);
@@ -170,6 +178,7 @@ where
                 match cell_ref {
                     Some(cell_ref) => {
                         if key == cell_ref.0.borrow() {
+                            //dbg!(num_entries_to_find);
                             Some((&cell_ref.0, &cell_ref.1))
                         } else {
                             None
@@ -196,11 +205,11 @@ where
             bucket: self,
             curr_entry_idx: 0,
             guard: unprotected(),
-            mut_mark: Mut_,
+            mut_mark: PhantomData,
         }
     }
 
-    pub fn transfer(&mut self, pair: Shared<(K, V)>, sign: u8) {
+    pub fn transfer(&mut self, pair: Shared<(K, V)>, sign: u8) -> bool {
         let mut last_bucket = &*self;
         let entries = unsafe { self.entries_mut() };
         for entry_ref in entries {
@@ -212,15 +221,56 @@ where
                 Some(_) => {}
                 None => {
                     entry_ref.store(Pair::Shared { pair, sign });
-                    return;
+                    return false;
                 }
             }
         }
-
         let new_bucket = Bucket::new();
         let entry_ref = unsafe { new_bucket.entries_mut().next().unwrap() };
         entry_ref.store(Pair::Shared { pair, sign });
         last_bucket.next.store(Owned::new(new_bucket), Release);
+        true
+    }
+
+    pub fn stats(&self, guard: &Guard) -> Stats {
+        let mut last_bucket = self;
+        let mut stats = Stats {
+            num_overflows: 0,
+            num_non_empty: 0,
+        };
+        for entry_ref in self.entries(guard) {
+            if entry_ref.bucket as *const _ != last_bucket as *const _ {
+                last_bucket = entry_ref.bucket;
+                stats.num_overflows += 1;
+            }
+            let pair = entry_ref.load_key_value(guard);
+            if !pair.is_null() {
+                stats.num_non_empty += 1;
+            }
+        }
+        stats
+    }
+}
+
+#[derive(Debug)]
+pub struct Stats {
+    pub num_non_empty: usize,
+    pub num_overflows: usize,
+}
+
+impl Stats {
+    pub fn zeroed() -> Self {
+        Self {
+            num_overflows: 0,
+            num_non_empty: 0
+        }
+    }
+}
+
+impl AddAssign for Stats {
+    fn add_assign(&mut self, rhs: Self) {
+        self.num_non_empty += rhs.num_non_empty;
+        self.num_overflows += rhs.num_overflows;
     }
 }
 
@@ -350,8 +400,12 @@ where
             bucket: self.bucket,
             curr_entry_idx: 0,
             guard,
-            mut_mark: Mut_,
+            mut_mark: PhantomData,
         }
+    }
+
+    pub fn stats(&self, guard: &Guard) -> Stats {
+        self.bucket.stats(guard)
     }
 }
 
@@ -364,6 +418,12 @@ pub enum InsertResult<'g, K, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_bucket_shape() {
+        assert_eq!(std::mem::size_of::<Bucket<u32, u32>>(), 64);
+        assert_eq!(std::mem::align_of::<[AtomicU8; ENTRIES_PER_BUCKET]>(), 1);
+    }
 
     #[test]
     fn test_insert_when_bucket_full_no_next() {
