@@ -3,11 +3,11 @@ use parking_lot::{Mutex, MutexGuard};
 use std::borrow::Borrow;
 use std::hash::Hash;
 use std::marker::PhantomData;
+use std::ops::AddAssign;
 use std::sync::atomic::{
     AtomicU8,
     Ordering::{Acquire, Release},
 };
-use std::ops::AddAssign;
 
 pub const ENTRIES_PER_BUCKET: usize = 5;
 
@@ -23,24 +23,25 @@ pub struct Mut_;
 pub struct Shared_;
 
 #[derive(Clone, Copy)]
-pub struct EntryRef<'a, K, V, M> {
-    cell: &'a Atomic<(K, V)>,
-    signature: &'a AtomicU8,
-    bucket: &'a Bucket<K, V>,
+pub struct EntryRef<'g, K, V, M> {
+    cell: &'g Atomic<(K, V)>,
+    signature: &'g AtomicU8,
+    bucket: &'g Bucket<K, V>,
     _mut_mark: PhantomData<M>,
+    guard: &'g Guard,
 }
 
-impl<'a, K, V, M> EntryRef<'a, K, V, M> {
+impl<'g, K, V, M> EntryRef<'g, K, V, M> {
     fn load_signature(&self) -> u8 {
         self.signature.load(Acquire)
     }
 
-    fn load_key_value<'g>(&self, guard: &'g Guard) -> Shared<'g, (K, V)> {
-        self.cell.load(Acquire, guard)
+    fn load_key_value(&self) -> Shared<'g, (K, V)> {
+        self.cell.load(Acquire, self.guard)
     }
 }
 
-impl<'a, K, V> EntryRef<'a, K, V, Mut_> {
+impl<'g, K, V> EntryRef<'g, K, V, Mut_> {
     fn store(&self, pair: Pair<K, V>) {
         match pair {
             Pair::Owned { pair, sign } => {
@@ -59,8 +60,8 @@ impl<'a, K, V> EntryRef<'a, K, V, Mut_> {
         self.signature.store(0, Release);
     }
 
-    pub fn swap_with_null<'g>(&self, guard: &'g Guard) -> Shared<'g, (K, V)> {
-        let old = self.cell.swap(Shared::null(), Release, guard);
+    pub fn swap_with_null(&self) -> Shared<'g, (K, V)> {
+        let old = self.cell.swap(Shared::null(), Release, self.guard);
         self.signature.store(0, Release);
         old
     }
@@ -92,6 +93,7 @@ where
                         signature,
                         bucket: self.bucket,
                         _mut_mark: PhantomData,
+                        guard: self.guard,
                     });
                 }
             } else {
@@ -163,22 +165,19 @@ where
         }
     }
 
-    pub fn find<'g, Q>(&self, key: &Q, signature: u8, guard: &'g Guard) -> Option<(&'g K, &'g V)>
+    pub fn find<'g, Q>(&'g self, key: &Q, signature: u8, guard: &'g Guard) -> Option<(&'g K, &'g V)>
     where
         Q: ?Sized + Hash + Eq,
         K: Borrow<Q>,
     {
-        //let mut num_entries_to_find = 0;
         self.entries(guard).find_map(|entry| {
-            //num_entries_to_find += 1;
             let cell_signature = entry.load_signature();
             if cell_signature == signature {
-                let cell = entry.load_key_value(guard);
+                let cell = entry.load_key_value();
                 let cell_ref = unsafe { cell.as_ref() };
                 match cell_ref {
                     Some(cell_ref) => {
                         if key == cell_ref.0.borrow() {
-                            //dbg!(num_entries_to_find);
                             Some((&cell_ref.0, &cell_ref.1))
                         } else {
                             None
@@ -192,11 +191,12 @@ where
         })
     }
 
-    pub fn write(&self) -> WriteGuard<'_, K, V> {
-        let guard = self.lock.lock();
+    pub fn write<'g>(&'g self, guard: &'g Guard) -> WriteGuard<'g, K, V> {
+        let lock_guard = self.lock.lock();
         WriteGuard {
-            _guard: guard,
+            _lock_guard: lock_guard,
             bucket: self,
+            guard
         }
     }
 
@@ -214,7 +214,7 @@ where
         let entries = unsafe { self.entries_mut() };
         for entry_ref in entries {
             last_bucket = entry_ref.bucket;
-            let cell = entry_ref.load_key_value(unsafe { unprotected() });
+            let cell = entry_ref.load_key_value();
             let cell_ref = unsafe { cell.as_ref() };
 
             match cell_ref {
@@ -243,7 +243,7 @@ where
                 last_bucket = entry_ref.bucket;
                 stats.num_overflows += 1;
             }
-            let pair = entry_ref.load_key_value(guard);
+            let pair = entry_ref.load_key_value();
             if !pair.is_null() {
                 stats.num_non_empty += 1;
             }
@@ -262,7 +262,7 @@ impl Stats {
     pub fn zeroed() -> Self {
         Self {
             num_overflows: 0,
-            num_non_empty: 0
+            num_non_empty: 0,
         }
     }
 }
@@ -299,27 +299,23 @@ impl<K, V> Drop for Bucket<K, V> {
     }
 }
 
-pub struct WriteGuard<'a, K, V> {
-    _guard: MutexGuard<'a, ()>,
-    bucket: &'a Bucket<K, V>,
+pub struct WriteGuard<'g, K, V> {
+    _lock_guard: MutexGuard<'g, ()>,
+    guard: &'g Guard,
+    bucket: &'g Bucket<K, V>,
 }
 
-impl<'a, K, V> WriteGuard<'a, K, V>
+impl<'g, K, V> WriteGuard<'g, K, V>
 where
     K: Eq + 'static,
     V: 'static,
 {
-    pub fn insert<'g>(
-        &self,
-        pair: (K, V),
-        pair_sign: u8,
-        guard: &'g Guard,
-    ) -> InsertResult<'g, K, V> {
+    pub fn insert(&self, pair: (K, V), pair_sign: u8) -> InsertResult<'g, K, V> {
         let mut empty_entry = None;
         let mut last_bucket = self.bucket;
-        for entry in self.entries_mut(guard) {
+        for entry in self.entries_mut() {
             last_bucket = entry.bucket;
-            let cell = entry.load_key_value(guard);
+            let cell = entry.load_key_value();
             let cell_ref = unsafe { cell.as_ref() };
             match cell_ref {
                 Some(cell_ref) => {
@@ -327,7 +323,7 @@ where
                     if sign == pair_sign && cell_ref.0 == pair.0 {
                         entry.store(Pair::Owned { pair, sign });
                         unsafe {
-                            guard.defer_destroy(cell);
+                            self.guard.defer_destroy(cell);
                         }
                         return InsertResult::Inserted(Some(cell_ref));
                     }
@@ -362,18 +358,13 @@ where
         }
     }
 
-    pub fn remove_entry<'g, Q>(
-        &self,
-        key: &Q,
-        key_sign: u8,
-        guard: &'g Guard,
-    ) -> Option<(&'g K, &'g V)>
+    pub fn remove_entry<Q>(&self, key: &Q, key_sign: u8) -> Option<(&'g K, &'g V)>
     where
         Q: ?Sized + Hash + Eq,
         K: Borrow<Q>,
     {
-        for entry in self.entries_mut(guard) {
-            let cell = entry.load_key_value(guard);
+        for entry in self.entries_mut() {
+            let cell = entry.load_key_value();
             let cell_ref = unsafe { cell.as_ref() };
 
             match cell_ref {
@@ -382,7 +373,7 @@ where
                     if entry_sign == key_sign && cell_ref.0.borrow() == key {
                         entry.clear();
                         unsafe {
-                            guard.defer_destroy(cell);
+                            self.guard.defer_destroy(cell);
                         }
                         return Some((&cell_ref.0, &cell_ref.1));
                     }
@@ -395,12 +386,12 @@ where
         None
     }
 
-    pub fn entries_mut(&self, guard: &'a Guard) -> EntryRefIter<'a, K, V, Mut_> {
+    pub fn entries_mut(&self) -> EntryRefIter<'g, K, V, Mut_> {
         EntryRefIter {
             bucket: self.bucket,
             curr_entry_idx: 0,
-            guard,
             mut_mark: PhantomData,
+            guard: self.guard
         }
     }
 
@@ -431,12 +422,12 @@ mod tests {
         let guard = pin();
         let pairs = (0..=5).map(|v| (v, v)).collect::<Vec<_>>();
         for (idx, pair) in pairs.iter().copied().enumerate() {
-            let w = bucket.write();
+            let w = bucket.write(&guard);
             if idx < 5 {
-                assert_eq!(w.insert(pair, 0, &guard), InsertResult::Inserted(None));
+                assert_eq!(w.insert(pair, 0), InsertResult::Inserted(None));
             } else {
                 assert_eq!(
-                    w.insert(pair, 0, &guard),
+                    w.insert(pair, 0),
                     InsertResult::InsertedWithOverflow
                 );
             }
@@ -453,12 +444,12 @@ mod tests {
         let guard = pin();
         let pairs = (0..=6).map(|v| (v, v)).collect::<Vec<_>>();
         for (idx, pair) in pairs.iter().copied().enumerate() {
-            let w = bucket.write();
+            let w = bucket.write(&guard);
             if idx != 5 {
-                assert_eq!(w.insert(pair, 0, &guard), InsertResult::Inserted(None));
+                assert_eq!(w.insert(pair, 0), InsertResult::Inserted(None));
             } else {
                 assert_eq!(
-                    w.insert(pair, 0, &guard),
+                    w.insert(pair, 0),
                     InsertResult::InsertedWithOverflow
                 );
             }
@@ -475,8 +466,8 @@ mod tests {
         let guard = pin();
         let pairs = (0..=20).map(|v| (v, v)).collect::<Vec<_>>();
         for pair in pairs.iter().copied() {
-            let w = bucket.write();
-            w.insert(pair, 0, &guard);
+            let w = bucket.write(&guard);
+            w.insert(pair, 0);
         }
 
         for pair in pairs.iter() {

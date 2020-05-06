@@ -60,11 +60,10 @@ where
     fn transfer_bucket<S: BuildHasher>(
         &mut self,
         build_hasher: &S,
-        bucket: &WriteGuard<K, V>,
-        guard: &Guard,
+        bucket: &WriteGuard<K, V>
     ) {
-        for entry in bucket.entries_mut(guard) {
-            let pair_opt = entry.swap_with_null(guard);
+        for entry in bucket.entries_mut() {
+            let pair_opt = entry.swap_with_null();
             unsafe {
                 if let Some(pair) = pair_opt.as_ref() {
                     let key_hash = hash(&pair.0, build_hasher);
@@ -130,13 +129,13 @@ where
         hash(key, &self.build_hasher)
     }
 
-    pub fn insert<'g>(&self, key: K, val: V, guard: &'g Guard) -> Option<&'g V> {
+    pub fn insert<'g>(&'g self, key: K, val: V, guard: &'g Guard) -> Option<&'g V> {
         let key_hash = self.hash(&key);
 
         let ins_res = self.run_locked(
             key_hash,
-            move |table_ptr, bucket, sign, g| {
-                let ins_res = bucket.insert((key, val), sign, g);
+            move |table_ptr, bucket, sign| {
+                let ins_res = bucket.insert((key, val), sign);
                 match ins_res {
                     InsertResult::InsertedWithOverflow => {
                         unsafe { table_ptr.deref().num_overflows.fetch_add(1, Relaxed) };
@@ -159,7 +158,7 @@ where
         old
     }
 
-    pub fn get<'g, Q>(&self, key: &Q, guard: &'g Guard) -> Option<&'g V>
+    pub fn get<'g, Q>(&'g self, key: &Q, guard: &'g Guard) -> Option<&'g V>
     where
         K: Borrow<Q>,
         Q: ?Sized + Hash + Eq,
@@ -167,7 +166,7 @@ where
         self.get_key_value(key, guard).map(|(_, val)| val)
     }
 
-    pub fn get_key_value<'g, Q>(&self, key: &Q, guard: &'g Guard) -> Option<(&'g K, &'g V)>
+    pub fn get_key_value<'g, Q>(&'g self, key: &Q, guard: &'g Guard) -> Option<(&'g K, &'g V)>
     where
         K: Borrow<Q>,
         Q: ?Sized + Hash + Eq,
@@ -179,7 +178,7 @@ where
         bucket.find(key, sign, guard)
     }
 
-    pub fn contains_key<'g, Q>(&self, key: &Q, guard: &'g Guard) -> bool
+    pub fn contains_key<Q>(&self, key: &Q, guard: &Guard) -> bool
     where
         K: Borrow<Q>,
         Q: ?Sized + Hash + Eq,
@@ -187,7 +186,7 @@ where
         self.get_key_value(key, guard).is_some()
     }
 
-    pub fn remove_entry<'g, Q>(&self, key: &Q, guard: &'g Guard) -> Option<(&'g K, &'g V)>
+    pub fn remove_entry<'g, Q>(&'g self, key: &Q, guard: &'g Guard) -> Option<(&'g K, &'g V)>
     where
         K: Borrow<Q>,
         Q: ?Sized + Hash + Eq,
@@ -196,11 +195,11 @@ where
 
         self.run_locked(
             key_hash,
-            move |_, bucket, sign, g| bucket.remove_entry(&key, sign, g),
+            move |_, bucket, sign| bucket.remove_entry(&key, sign),
             guard,
         )
     }
-    pub fn remove<'g, Q>(&self, key: &Q, guard: &'g Guard) -> Option<&'g V>
+    pub fn remove<'g, Q>(&'g self, key: &Q, guard: &'g Guard) -> Option<&'g V>
     where
         K: Borrow<Q>,
         Q: ?Sized + Hash + Eq,
@@ -208,9 +207,8 @@ where
         self.remove_entry(key, guard).map(|(_, val)| val)
     }
 
-    fn run_locked<'g, F, R: 'g>(&self, key_hash: u64, func: F, guard: &'g Guard) -> R
-    where
-        for<'a> F: FnOnce(Shared<'g, RawTable<K, V>>, WriteGuard<'a, K, V>, u8, &'g Guard) -> R,
+    fn run_locked<'g, F, R: 'g>(&'g self, key_hash: u64, func: F, guard: &'g Guard) -> R
+    where F: FnOnce(Shared<'g, RawTable<K, V>>, WriteGuard<'g, K, V>, u8) -> R,
     {
         loop {
             let old_raw = self.raw_ptr.load(Acquire, guard);
@@ -218,7 +216,7 @@ where
             // find and lock bucket for insert
             let raw_ref = unsafe { old_raw.deref() };
             let bucket = raw_ref.bucket_for_hash(key_hash);
-            let bucket_write = bucket.write();
+            let bucket_write = bucket.write(guard);
 
             // we locked the bucket, check that table was not resized before we locked the bucket,
             //TODO: add note why we can't miss resize here
@@ -227,7 +225,7 @@ where
             if old_raw == cur_raw && cur_raw.tag() == RAW_TABLE_STATE_QUIESCENCE {
                 // old_raw == cur_raw, we can use raw_ref safely
                 let key_sig = raw_ref.signature(key_hash);
-                return func(cur_raw, bucket_write, key_sig, guard);
+                return func(cur_raw, bucket_write, key_sig);
             }
             // table was resized, try again
             continue;
@@ -251,7 +249,7 @@ where
                 let mut guards = Vec::new();
                 let mut stats = Stats::zeroed();
                 for bucket in &*raw_ref.buckets {
-                    let bucket_write = bucket.write();
+                    let bucket_write = bucket.write(guard);
                     let bucket_stats = bucket_write.stats(&guard);
                     stats += bucket_stats;
                     guards.push(bucket_write);
@@ -274,7 +272,7 @@ where
                 let mut new_raw_table = RawTable::with_pow_buckets(new_pow);
 
                 for bucket_write in &guards {
-                    new_raw_table.transfer_bucket(&self.build_hasher, bucket_write, guard);
+                    new_raw_table.transfer_bucket(&self.build_hasher, bucket_write);
                 }
 
                 self.raw_ptr.store(Owned::new(new_raw_table), Release);
