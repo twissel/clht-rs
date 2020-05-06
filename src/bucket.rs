@@ -24,20 +24,27 @@ pub struct Shared_;
 
 #[derive(Clone, Copy)]
 pub struct EntryRef<'g, K, V, M> {
-    cell: &'g Atomic<(K, V)>,
-    signature: &'g AtomicU8,
     bucket: &'g Bucket<K, V>,
+    bucket_pos: usize,
     _mut_mark: PhantomData<M>,
     guard: &'g Guard,
 }
 
 impl<'g, K, V, M> EntryRef<'g, K, V, M> {
     fn load_signature(&self) -> u8 {
-        self.signature.load(Acquire)
+        self.signature().load(Acquire)
     }
 
     fn load_key_value(&self) -> Shared<'g, (K, V)> {
-        self.cell.load(Acquire, self.guard)
+        self.cell().load(Acquire, self.guard)
+    }
+
+    fn cell(&self) -> &Atomic<(K, V)> {
+        unsafe { self.bucket.cells.get_unchecked(self.bucket_pos) }
+    }
+
+    fn signature(&self) -> &AtomicU8 {
+        unsafe { self.bucket.signatures.get_unchecked(self.bucket_pos) }
     }
 }
 
@@ -45,24 +52,24 @@ impl<'g, K, V> EntryRef<'g, K, V, Mut_> {
     fn store(&self, pair: Pair<K, V>) {
         match pair {
             Pair::Owned { pair, sign } => {
-                self.cell.store(Owned::new(pair), Release);
-                self.signature.store(sign, Release);
+                self.cell().store(Owned::new(pair), Release);
+                self.signature().store(sign, Release);
             }
             Pair::Shared { sign, pair } => {
-                self.cell.store(pair, Release);
-                self.signature.store(sign, Release);
+                self.cell().store(pair, Release);
+                self.signature().store(sign, Release);
             }
         };
     }
 
     fn clear(&self) {
-        self.cell.store(Shared::null(), Release);
-        self.signature.store(0, Release);
+        self.cell().store(Shared::null(), Release);
+        self.signature().store(0, Release);
     }
 
     pub fn swap_with_null(&self) -> Shared<'g, (K, V)> {
-        let old = self.cell.swap(Shared::null(), Release, self.guard);
-        self.signature.store(0, Release);
+        let old = self.cell().swap(Shared::null(), Release, self.guard);
+        self.signature().store(0, Release);
         old
     }
 }
@@ -84,18 +91,14 @@ where
         loop {
             let len = self.bucket.cells.len();
             if self.curr_entry_idx < len {
-                unsafe {
-                    let cell = self.bucket.cells.get_unchecked(self.curr_entry_idx);
-                    let signature = self.bucket.signatures.get_unchecked(self.curr_entry_idx);
-                    self.curr_entry_idx += 1;
-                    return Some(EntryRef {
-                        cell,
-                        signature,
-                        bucket: self.bucket,
-                        _mut_mark: PhantomData,
-                        guard: self.guard,
-                    });
-                }
+                let entry = Some(EntryRef {
+                    bucket: self.bucket,
+                    bucket_pos: self.curr_entry_idx,
+                    _mut_mark: PhantomData,
+                    guard: self.guard,
+                });
+                self.curr_entry_idx += 1;
+                return entry;
             } else {
                 let next_bucket = self.bucket.next.load(Acquire, self.guard);
                 let next_bucket_ref = unsafe { next_bucket.as_ref() };
@@ -196,7 +199,7 @@ where
         WriteGuard {
             _lock_guard: lock_guard,
             bucket: self,
-            guard
+            guard,
         }
     }
 
@@ -391,7 +394,7 @@ where
             bucket: self.bucket,
             curr_entry_idx: 0,
             mut_mark: PhantomData,
-            guard: self.guard
+            guard: self.guard,
         }
     }
 
@@ -426,10 +429,7 @@ mod tests {
             if idx < 5 {
                 assert_eq!(w.insert(pair, 0), InsertResult::Inserted(None));
             } else {
-                assert_eq!(
-                    w.insert(pair, 0),
-                    InsertResult::InsertedWithOverflow
-                );
+                assert_eq!(w.insert(pair, 0), InsertResult::InsertedWithOverflow);
             }
         }
 
@@ -448,10 +448,7 @@ mod tests {
             if idx != 5 {
                 assert_eq!(w.insert(pair, 0), InsertResult::Inserted(None));
             } else {
-                assert_eq!(
-                    w.insert(pair, 0),
-                    InsertResult::InsertedWithOverflow
-                );
+                assert_eq!(w.insert(pair, 0), InsertResult::InsertedWithOverflow);
             }
         }
 
