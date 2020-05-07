@@ -117,16 +117,11 @@ where
     }
 }
 
-#[repr(C)]
+#[repr(align(64))]
 pub struct Bucket<K, V> {
-    // 1 byte
     lock: Mutex<()>,
-    // 5 bytes
     signatures: [AtomicU8; ENTRIES_PER_BUCKET],
-    _pad: u64,
-    // 40 bytes
     cells: [Atomic<(K, V)>; ENTRIES_PER_BUCKET],
-    // 8 bytes
     next: Atomic<Bucket<K, V>>,
 }
 
@@ -149,7 +144,6 @@ impl<K, V> Bucket<K, V> {
                 AtomicU8::new(0),
             ],
             next: Atomic::null(),
-            _pad: 0,
         }
     }
 }
@@ -415,8 +409,12 @@ mod tests {
 
     #[test]
     fn test_bucket_shape() {
-        assert_eq!(std::mem::size_of::<Bucket<u32, u32>>(), 64);
-        assert_eq!(std::mem::align_of::<[AtomicU8; ENTRIES_PER_BUCKET]>(), 1);
+        let array: [Bucket<u64, u64>; 2] = [Bucket::new(), Bucket::new()];
+        let addr1 = &array[0] as *const Bucket<u64, u64> as usize;
+        let addr2 = &array[1] as *const Bucket<u64, u64> as usize;
+        assert_eq!(addr2 - addr1, 64);
+        assert_eq!(addr1 % 64, 0);
+        assert_eq!(addr2 % 64, 0);
     }
 
     #[test]
