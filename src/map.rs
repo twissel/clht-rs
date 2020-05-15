@@ -83,6 +83,7 @@ where
 pub struct HashMap<K, V, S = crate::DefaultHashBuilder> {
     raw_ptr: Atomic<RawTable<K, V>>,
     build_hasher: S,
+    collector: Collector
 }
 
 impl<K, V> HashMap<K, V, crate::DefaultHashBuilder> {
@@ -117,6 +118,15 @@ impl<K, V, S> HashMap<K, V, S> {
         Self {
             raw_ptr: Atomic::new(RawTable::with_pow_buckets(cap_log2)),
             build_hasher,
+            collector: default_collector().clone()
+        }
+    }
+
+    #[inline]
+    fn check_guard(&self, guard: &Guard) {
+        // guard.collector() may be `None` if it is unprotected
+        if let Some(c) = guard.collector() {
+            assert_eq!(c, &self.collector);
         }
     }
 }
@@ -136,6 +146,7 @@ where
     V: 'static + Send + Sync,
     S: BuildHasher,
 {
+    #[inline]
     fn hash<Q: ?Sized + Hash>(&self, key: &Q) -> u64 {
         hash(key, &self.build_hasher)
     }
@@ -147,6 +158,8 @@ where
     /// If the map did have this key present, the value is updated, and the old
     /// value is returned. The key is not updated, though;
     pub fn insert<'g>(&'g self, key: K, val: V, guard: &'g Guard) -> Option<&'g V> {
+        self.check_guard(guard);
+
         let key_hash = self.hash(&key);
 
         let ins_res = self.run_locked(
@@ -205,6 +218,7 @@ where
         K: Borrow<Q>,
         Q: ?Sized + Hash + Eq,
     {
+        self.check_guard(guard);
         let key_hash = self.hash(key);
         let raw_ref = unsafe { self.raw_ptr.load(Acquire, guard).deref() };
         let bucket = raw_ref.bucket_for_hash(key_hash);
@@ -271,6 +285,7 @@ where
     fn run_locked<'g, F, R: 'g>(&'g self, key_hash: u64, func: F, guard: &'g Guard) -> R
     where F: FnOnce(Shared<'g, RawTable<K, V>>, WriteGuard<'g, K, V>, u8) -> R,
     {
+        self.check_guard(guard);
         loop {
             let old_raw = self.raw_ptr.load(Acquire, guard);
 
