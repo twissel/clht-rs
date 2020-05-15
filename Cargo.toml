@@ -4,19 +4,28 @@ version = "0.1.0"
 edition = "2018"
 
 [dependencies]
-crossbeam = "0.7.3"
-parking_lot = "0.10.0"
-ahash = "0.3.3"
+crossbeam = "0.7"
+parking_lot = "0.10"
+ahash = "0.3"
 
 [dev-dependencies]
 rand = "0.7"
 rayon = "1.3"
 criterion = "0.3"
-num_cpus = "1.12.0"
+num_cpus = "1.12"
 mimalloc = { version = "0.1", default-features = false }
+bustle = "0.4"
+tracing = { version = "0.1", features = ["std"], default-features = false }
+tracing-subscriber = "0.2"
+flurry = "0.3"
+
 
 [[bench]]
 name = "clht"
+harness = false
+
+[[bench]]
+name = "bustle"
 harness = false
 
 [profile.release]
