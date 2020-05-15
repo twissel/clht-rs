@@ -79,26 +79,37 @@ where
     }
 }
 
+/// A concurrent hash table.
 pub struct HashMap<K, V, S = crate::DefaultHashBuilder> {
     raw_ptr: Atomic<RawTable<K, V>>,
     build_hasher: S,
 }
 
 impl<K, V> HashMap<K, V, crate::DefaultHashBuilder> {
+
+    /// Creates an `HashMap`.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Creates an empty `HashMap` with the specified capacity.
     pub fn with_capacity(capacity: usize) -> Self {
         Self::with_capacity_and_hasher(capacity, crate::DefaultHashBuilder::default())
     }
 }
 
 impl<K, V, S> HashMap<K, V, S> {
+
+    /// Creates an empty `HashMap` which will use the given hash builder to hash
+    /// keys.
+    ///
+    /// The created map has the default initial capacity.
     pub fn with_hasher(hash_builder: S) -> Self {
         Self::with_capacity_and_hasher(2, hash_builder)
     }
 
+    /// Creates an empty `HashMap` with the specified capacity, using `hash_builder`
+    /// to hash the keys.
     pub fn with_capacity_and_hasher(capacity: usize, build_hasher: S) -> Self {
         let capacity = capacity.next_power_of_two();
         let cap_log2 = (capacity as f64).log2().ceil() as u32;
@@ -129,6 +140,12 @@ where
         hash(key, &self.build_hasher)
     }
 
+    /// Inserts a key-value pair into the map.
+    ///
+    /// If the map did not have this key present, [`None`] is returned.
+    ///
+    /// If the map did have this key present, the value is updated, and the old
+    /// value is returned. The key is not updated, though;
     pub fn insert<'g>(&'g self, key: K, val: V, guard: &'g Guard) -> Option<&'g V> {
         let key_hash = self.hash(&key);
 
@@ -158,6 +175,14 @@ where
         old
     }
 
+    /// Returns a reference to the value corresponding to the key.
+    ///
+    /// The key may be any borrowed form of the map's key type, but
+    /// [`Hash`] and [`Eq`] on the borrowed form *must* match those for
+    /// the key type.
+    ///
+    /// [`Eq`]: std::cmp::Eq
+    /// [`Hash`]: std::hash::Hash
     pub fn get<'g, Q>(&'g self, key: &Q, guard: &'g Guard) -> Option<&'g V>
     where
         K: Borrow<Q>,
@@ -166,6 +191,15 @@ where
         self.get_key_value(key, guard).map(|(_, val)| val)
     }
 
+
+    /// Returns the key-value pair corresponding to the supplied key.
+    ///
+    /// The supplied key may be any borrowed form of the map's key type, but
+    /// [`Hash`] and [`Eq`] on the borrowed form *must* match those for
+    /// the key type.
+    ///
+    /// [`Eq`]: std::cmp::Eq
+    /// [`Hash`]: std::hash::Hash
     pub fn get_key_value<'g, Q>(&'g self, key: &Q, guard: &'g Guard) -> Option<(&'g K, &'g V)>
     where
         K: Borrow<Q>,
@@ -178,6 +212,14 @@ where
         bucket.find(key, sign, guard)
     }
 
+    /// Returns `true` if the map contains a value for the specified key.
+    ///
+    /// The key may be any borrowed form of the map's key type, but
+    /// [`Hash`] and [`Eq`] on the borrowed form *must* match those for
+    /// the key type.
+    ///
+    /// [`Eq`]: std::cmp::Eq
+    /// [`Hash`]: std::hash::Hash
     pub fn contains_key<Q>(&self, key: &Q, guard: &Guard) -> bool
     where
         K: Borrow<Q>,
@@ -186,6 +228,15 @@ where
         self.get_key_value(key, guard).is_some()
     }
 
+    /// Removes a key from the map, returning the stored key and value if the
+    /// key was previously in the map.
+    ///
+    /// The key may be any borrowed form of the map's key type, but
+    /// [`Hash`] and [`Eq`] on the borrowed form *must* match those for
+    /// the key type.
+    ///
+    /// [`Eq`]: std::cmp::Eq
+    /// [`Hash`]: std::hash::Hash
     pub fn remove_entry<'g, Q>(&'g self, key: &Q, guard: &'g Guard) -> Option<(&'g K, &'g V)>
     where
         K: Borrow<Q>,
@@ -199,6 +250,16 @@ where
             guard,
         )
     }
+
+    /// Removes a key from the map, returning the value at the key if the key
+    /// was previously in the map.
+    ///
+    /// The key may be any borrowed form of the map's key type, but
+    /// [`Hash`] and [`Eq`] on the borrowed form *must* match those for
+    /// the key type.
+    ///
+    /// [`Eq`]: std::cmp::Eq
+    /// [`Hash`]: std::hash::Hash
     pub fn remove<'g, Q>(&'g self, key: &Q, guard: &'g Guard) -> Option<&'g V>
     where
         K: Borrow<Q>,
