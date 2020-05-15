@@ -274,7 +274,6 @@ where
                 for bucket_write in &guards {
                     new_raw_table.transfer_bucket(&self.build_hasher, bucket_write);
                 }
-
                 self.raw_ptr.store(Owned::new(new_raw_table), Release);
                 drop(guards);
                 unsafe {
@@ -309,7 +308,7 @@ mod test {
 
     #[test]
     fn test_simple_insert() {
-        let map = Arc::new(HashMap::with_capacity(1));
+        let map = Arc::new(HashMap::new());
         let handles = (0..=2)
             .map(|v| {
                 let m = Arc::clone(&map);
@@ -326,6 +325,32 @@ mod test {
         let g = pin();
         for k in 0..=2 {
             assert_eq!(map.get(&k, &g), Some(&k));
+        }
+    }
+
+    #[test]
+    fn test_simple_delete() {
+        let map = Arc::new(HashMap::new());
+        let g = pin();
+        for k in 0..=36 {
+            assert_eq!(map.insert(k, k, &g), None);
+        }
+        let handles = (0..=36)
+            .map(|k| {
+                let m = Arc::clone(&map);
+                thread::spawn(move || {
+                    let g = pin();
+                    assert!(m.remove(&k, &g).is_some());
+                })
+            })
+            .collect::<Vec<_>>();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let g = pin();
+        for k in 0..=36 {
+            assert!(map.get(&k, &g).is_none());
         }
     }
 }
