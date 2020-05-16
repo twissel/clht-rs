@@ -8,7 +8,7 @@ use std::sync::Arc;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const ITER: u64 = 32 * 1024;
+const ITER: u64 = 24 * 1024;
 
 fn task_insert_u64_u64(threads: usize) -> HashMap<u64, u64> {
     let map = Arc::new(HashMap::new());
@@ -144,7 +144,6 @@ fn get_u64_u64(c: &mut Criterion) {
     let mut group = c.benchmark_group("get_u64_u64");
     group.throughput(Throughput::Elements(ITER as u64));
     let max = num_cpus::get();
-
     for threads in max..=max {
         let map = Arc::new(task_insert_u64_u64(threads));
 
@@ -166,8 +165,8 @@ fn get_u64_u64(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    get_u64_u64_single_thread,
-    insert_u64_u64,
+    //get_u64_u64_single_thread,
+    //insert_u64_u64,
     get_u64_u64
 );
 criterion_main!(benches);
