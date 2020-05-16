@@ -64,25 +64,25 @@ impl Collection for FlurryTable {
     type Handle = FlurryTableHandle;
 
     fn with_capacity(capacity: usize) -> Self {
-        Self(std::sync::Arc::new(flurry::HashSet::with_capacity(capacity)))
+        Self(std::sync::Arc::new(flurry::HashSet::with_capacity(
+            capacity,
+        )))
     }
 
     fn pin(&self) -> Self::Handle {
         FlurryTableHandle {
             guard: epoch::pin(),
-            table: self.clone()
+            table: self.clone(),
         }
     }
 }
-
 
 struct FlurryTableHandle {
     guard: epoch::Guard,
     table: FlurryTable,
 }
 
-
-impl CollectionHandle for FlurryTableHandle  {
+impl CollectionHandle for FlurryTableHandle {
     type Key = u64;
 
     fn get(&mut self, key: &Self::Key) -> bool {
@@ -90,10 +90,7 @@ impl CollectionHandle for FlurryTableHandle  {
     }
 
     fn insert(&mut self, key: &Self::Key) -> bool {
-        self.table.0.insert(
-            *key,
-            &self.guard,
-        )
+        self.table.0.insert(*key, &self.guard)
     }
 
     fn remove(&mut self, key: &Self::Key) -> bool {
@@ -109,7 +106,6 @@ impl CollectionHandle for FlurryTableHandle  {
         }
     }
 }
-
 
 fn main() {
     tracing_subscriber::fmt::init();

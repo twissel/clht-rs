@@ -395,6 +395,14 @@ where
     pub fn stats(&self, guard: &Guard) -> Stats {
         self.bucket.stats(guard)
     }
+
+    pub fn find<Q>(&self, key: &Q, signature: u8) -> Option<(&K, &V)>
+    where
+        Q: ?Sized + Hash + Eq,
+        K: Borrow<Q>,
+    {
+        self.bucket.find(key, signature, &self.guard)
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]

@@ -8,6 +8,7 @@ const RAW_TABLE_STATE_QUIESCENCE: usize = 0;
 const RAW_TABLE_STATE_GROWING: usize = 1;
 const OCCUPANCY_AFTER_RESIZE: f64 = 40.0;
 
+#[inline]
 fn hash<K: Hash + ?Sized, S: BuildHasher>(key: &K, build_hasher: &S) -> u64 {
     let mut hasher = build_hasher.build_hasher();
     key.hash(&mut hasher);
@@ -37,31 +38,31 @@ where
     K: Hash + Eq + 'static,
     V: 'static,
 {
+    #[inline]
     fn bucket_index(&self, hash: u64) -> usize {
         let index = hash >> (64 - self.cap_log2 as u64);
         index as usize
     }
 
+    #[inline]
     fn bucket_for_hash(&self, hash: u64) -> &Bucket<K, V> {
         let index = self.bucket_index(hash);
         unsafe { self.buckets.get_unchecked(index) }
     }
 
+    #[inline]
     fn bucket_mut_for_hash(&mut self, hash: u64) -> &mut Bucket<K, V> {
         let index = self.bucket_index(hash);
         unsafe { self.buckets.get_unchecked_mut(index) }
     }
 
+    #[inline]
     fn signature(&self, hash: u64) -> u8 {
         let sign = hash >> (64 - 8 - self.cap_log2 as u64) & ((1 << 8) - 1);
         sign as u8
     }
 
-    fn transfer_bucket<S: BuildHasher>(
-        &mut self,
-        build_hasher: &S,
-        bucket: &WriteGuard<K, V>
-    ) {
+    fn transfer_bucket<S: BuildHasher>(&mut self, build_hasher: &S, bucket: &WriteGuard<K, V>) {
         for entry in bucket.entries_mut() {
             let pair_opt = entry.swap_with_null();
             unsafe {
@@ -83,11 +84,10 @@ where
 pub struct HashMap<K, V, S = crate::DefaultHashBuilder> {
     raw_ptr: Atomic<RawTable<K, V>>,
     build_hasher: S,
-    collector: Collector
+    collector: Collector,
 }
 
 impl<K, V> HashMap<K, V, crate::DefaultHashBuilder> {
-
     /// Creates an `HashMap`.
     pub fn new() -> Self {
         Self::default()
@@ -100,7 +100,6 @@ impl<K, V> HashMap<K, V, crate::DefaultHashBuilder> {
 }
 
 impl<K, V, S> HashMap<K, V, S> {
-
     /// Creates an empty `HashMap` which will use the given hash builder to hash
     /// keys.
     ///
@@ -118,7 +117,7 @@ impl<K, V, S> HashMap<K, V, S> {
         Self {
             raw_ptr: Atomic::new(RawTable::with_pow_buckets(cap_log2)),
             build_hasher,
-            collector: default_collector().clone()
+            collector: default_collector().clone(),
         }
     }
 
@@ -158,8 +157,6 @@ where
     /// If the map did have this key present, the value is updated, and the old
     /// value is returned. The key is not updated, though;
     pub fn insert<'g>(&'g self, key: K, val: V, guard: &'g Guard) -> Option<&'g V> {
-        self.check_guard(guard);
-
         let key_hash = self.hash(&key);
 
         let ins_res = self.run_locked(
@@ -188,6 +185,46 @@ where
         old
     }
 
+    /// Inserts a key-value pair into the map unless the key already exists.
+    ///
+    /// If the map does not contain the key, the key-value pair is inserted
+    /// and this method returns `Ok`.
+    ///
+    /// If the map does contain the key, the map is left unchanged and this
+    /// method returns `Err`
+    pub fn try_insert<'g>(&'g self, key: K, val: V, guard: &'g Guard) -> Result<(), V> {
+        let key_hash = self.hash(&key);
+        let ins_res = self.run_locked(
+            key_hash,
+            move |table_ptr, bucket, sign| {
+                let c = bucket.find(&key, sign);
+                if c.is_some() {
+                    (table_ptr, Err(val), true)
+                } else {
+                    let ins_res = bucket.insert((key, val), sign);
+                    match ins_res {
+                        InsertResult::InsertedWithOverflow => {
+                            unsafe { table_ptr.deref().num_overflows.fetch_add(1, Relaxed) };
+                            (table_ptr, Ok(()), true)
+                        }
+                        InsertResult::Inserted(old_pair) => match old_pair {
+                            None => (table_ptr, Ok(()), false),
+                            Some(_) => unreachable!("logic error, try_insert is buggy"),
+                        },
+                    }
+                }
+            },
+            guard,
+        );
+        let (table_ptr, ins_res, overflowed) = ins_res;
+
+        if overflowed {
+            self.try_grow(table_ptr, guard);
+        }
+
+        ins_res
+    }
+
     /// Returns a reference to the value corresponding to the key.
     ///
     /// The key may be any borrowed form of the map's key type, but
@@ -196,6 +233,7 @@ where
     ///
     /// [`Eq`]: std::cmp::Eq
     /// [`Hash`]: std::hash::Hash
+    #[inline]
     pub fn get<'g, Q>(&'g self, key: &Q, guard: &'g Guard) -> Option<&'g V>
     where
         K: Borrow<Q>,
@@ -203,7 +241,6 @@ where
     {
         self.get_key_value(key, guard).map(|(_, val)| val)
     }
-
 
     /// Returns the key-value pair corresponding to the supplied key.
     ///
@@ -234,6 +271,7 @@ where
     ///
     /// [`Eq`]: std::cmp::Eq
     /// [`Hash`]: std::hash::Hash
+    #[inline]
     pub fn contains_key<Q>(&self, key: &Q, guard: &Guard) -> bool
     where
         K: Borrow<Q>,
@@ -251,6 +289,7 @@ where
     ///
     /// [`Eq`]: std::cmp::Eq
     /// [`Hash`]: std::hash::Hash
+    #[inline]
     pub fn remove_entry<'g, Q>(&'g self, key: &Q, guard: &'g Guard) -> Option<(&'g K, &'g V)>
     where
         K: Borrow<Q>,
@@ -274,6 +313,7 @@ where
     ///
     /// [`Eq`]: std::cmp::Eq
     /// [`Hash`]: std::hash::Hash
+    #[inline]
     pub fn remove<'g, Q>(&'g self, key: &Q, guard: &'g Guard) -> Option<&'g V>
     where
         K: Borrow<Q>,
@@ -283,7 +323,8 @@ where
     }
 
     fn run_locked<'g, F, R: 'g>(&'g self, key_hash: u64, func: F, guard: &'g Guard) -> R
-    where F: FnOnce(Shared<'g, RawTable<K, V>>, WriteGuard<'g, K, V>, u8) -> R,
+    where
+        F: FnOnce(Shared<'g, RawTable<K, V>>, WriteGuard<'g, K, V>, u8) -> R,
     {
         self.check_guard(guard);
         loop {
