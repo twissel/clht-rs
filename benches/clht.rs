@@ -110,9 +110,9 @@ fn task_get_u64_u64(threads: usize, map: Arc<HashMap<u64, u64>>) {
             let m = map.clone();
             s.spawn(move |_| {
                 let start = t * inc;
-                let guard = epoch::pin();
+                let map_ref = m.pin();
                 for i in start..(start + inc) {
-                    let v = m.get(&i, &guard);
+                    let v = map_ref.get(&i);
                     assert_eq!(v, Some(&(i + 7)));
                 }
             });
@@ -125,14 +125,15 @@ fn get_u64_u64_single_thread(c: &mut Criterion) {
     for i in 0..ITER {
         map.insert(i, i + 7, unsafe { crossbeam::epoch::unprotected() });
     }
+    let map_ref = map.pin();
     c.bench_function("get_u64_u64_single_thread", |bencher| {
         bencher.iter_batched(
             || {
                 let mut rng = rand::thread_rng();
                 rng.gen_range(0, ITER)
             },
-            |key| unsafe {
-                let v = map.get(&key, crossbeam::epoch::unprotected());
+            |key| {
+                let v = map_ref.get(&key);
                 assert_eq!(v, Some(&(key + 7)));
             },
             BatchSize::SmallInput,

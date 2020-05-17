@@ -1,5 +1,6 @@
 use crate::bucket::{Bucket, InsertResult, Stats, WriteGuard, ENTRIES_PER_BUCKET};
 use crossbeam::epoch::*;
+use crossbeam::utils::CachePadded;
 use std::borrow::Borrow;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::atomic::{Ordering::*, *};
@@ -82,7 +83,7 @@ where
 
 /// A concurrent hash table.
 pub struct HashMap<K, V, S = crate::DefaultHashBuilder> {
-    raw_ptr: Atomic<RawTable<K, V>>,
+    raw_ptr: CachePadded<Atomic<RawTable<K, V>>>,
     build_hasher: S,
     collector: Collector,
 }
@@ -115,7 +116,7 @@ impl<K, V, S> HashMap<K, V, S> {
         let cap_log2 = (capacity as f64).log2().ceil() as u32;
         let cap_log2 = if cap_log2 < 2 { 2 } else { cap_log2 };
         Self {
-            raw_ptr: Atomic::new(RawTable::with_pow_buckets(cap_log2)),
+            raw_ptr: CachePadded::new(Atomic::new(RawTable::with_pow_buckets(cap_log2))),
             build_hasher,
             collector: default_collector().clone(),
         }
@@ -150,13 +151,37 @@ where
         hash(key, &self.build_hasher)
     }
 
+    #[inline]
+    pub fn pin(&self) -> HashMapRef<K, V, S> {
+        let guard = self.collector.register().pin();
+        HashMapRef {
+            guard: GuardRef::Owned(guard),
+            map: self,
+        }
+    }
+
+    #[inline]
+    pub fn with_guard<'g>(&'g self, guard: &'g Guard) -> HashMapRef<K, V, S> {
+        self.check_guard(guard);
+        HashMapRef {
+            guard: GuardRef::Ref(guard),
+            map: self,
+        }
+    }
+
     /// Inserts a key-value pair into the map.
     ///
     /// If the map did not have this key present, [`None`] is returned.
     ///
     /// If the map did have this key present, the value is updated, and the old
     /// value is returned. The key is not updated, though;
+    #[inline]
     pub fn insert<'g>(&'g self, key: K, val: V, guard: &'g Guard) -> Option<&'g V> {
+        self.check_guard(guard);
+        self.insert_unchecked(key, val, guard)
+    }
+
+    pub fn insert_unchecked<'g>(&'g self, key: K, val: V, guard: &'g Guard) -> Option<&'g V> {
         let key_hash = self.hash(&key);
 
         let ins_res = self.run_locked(
@@ -192,7 +217,13 @@ where
     ///
     /// If the map does contain the key, the map is left unchanged and this
     /// method returns `Err`
+    #[inline]
     pub fn try_insert<'g>(&'g self, key: K, val: V, guard: &'g Guard) -> Result<(), V> {
+        self.check_guard(guard);
+        self.try_insert_unchecked(key, val, guard)
+    }
+
+    fn try_insert_unchecked<'g>(&'g self, key: K, val: V, guard: &'g Guard) -> Result<(), V> {
         let key_hash = self.hash(&key);
         let ins_res = self.run_locked(
             key_hash,
@@ -239,7 +270,17 @@ where
         K: Borrow<Q>,
         Q: ?Sized + Hash + Eq,
     {
-        self.get_key_value(key, guard).map(|(_, val)| val)
+        self.check_guard(guard);
+        self.get_unchecked(key, guard)
+    }
+
+    #[inline]
+    fn get_unchecked<'g, Q>(&'g self, key: &Q, guard: &'g Guard) -> Option<&'g V>
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + Hash + Eq,
+    {
+        self.get_key_value_unchecked(key, guard).map(|(_, val)| val)
     }
 
     /// Returns the key-value pair corresponding to the supplied key.
@@ -250,12 +291,21 @@ where
     ///
     /// [`Eq`]: std::cmp::Eq
     /// [`Hash`]: std::hash::Hash
+    #[inline]
     pub fn get_key_value<'g, Q>(&'g self, key: &Q, guard: &'g Guard) -> Option<(&'g K, &'g V)>
     where
         K: Borrow<Q>,
         Q: ?Sized + Hash + Eq,
     {
         self.check_guard(guard);
+        self.get_key_value_unchecked(key, guard)
+    }
+
+    fn get_key_value_unchecked<'g, Q>(&'g self, key: &Q, guard: &'g Guard) -> Option<(&'g K, &'g V)>
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + Hash + Eq,
+    {
         let key_hash = self.hash(key);
         let raw_ref = unsafe { self.raw_ptr.load(Acquire, guard).deref() };
         let bucket = raw_ref.bucket_for_hash(key_hash);
@@ -277,7 +327,16 @@ where
         K: Borrow<Q>,
         Q: ?Sized + Hash + Eq,
     {
-        self.get_key_value(key, guard).is_some()
+        self.check_guard(guard);
+        self.contains_key_unchecked(key, guard)
+    }
+
+    fn contains_key_unchecked<Q>(&self, key: &Q, guard: &Guard) -> bool
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + Hash + Eq,
+    {
+        self.get_key_value_unchecked(key, guard).is_some()
     }
 
     /// Removes a key from the map, returning the stored key and value if the
@@ -291,6 +350,15 @@ where
     /// [`Hash`]: std::hash::Hash
     #[inline]
     pub fn remove_entry<'g, Q>(&'g self, key: &Q, guard: &'g Guard) -> Option<(&'g K, &'g V)>
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + Hash + Eq,
+    {
+        self.check_guard(guard);
+        self.remove_entry_unchecked(key, guard)
+    }
+
+    fn remove_entry_unchecked<'g, Q>(&'g self, key: &Q, guard: &'g Guard) -> Option<(&'g K, &'g V)>
     where
         K: Borrow<Q>,
         Q: ?Sized + Hash + Eq,
@@ -319,14 +387,23 @@ where
         K: Borrow<Q>,
         Q: ?Sized + Hash + Eq,
     {
-        self.remove_entry(key, guard).map(|(_, val)| val)
+        self.check_guard(guard);
+        self.remove_unchecked(key, guard)
+    }
+
+    #[inline]
+    fn remove_unchecked<'g, Q>(&'g self, key: &Q, guard: &'g Guard) -> Option<&'g V>
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + Hash + Eq,
+    {
+        self.remove_entry_unchecked(key, guard).map(|(_, val)| val)
     }
 
     fn run_locked<'g, F, R: 'g>(&'g self, key_hash: u64, func: F, guard: &'g Guard) -> R
     where
         F: FnOnce(Shared<'g, RawTable<K, V>>, WriteGuard<'g, K, V>, u8) -> R,
     {
-        self.check_guard(guard);
         loop {
             let old_raw = self.raw_ptr.load(Acquire, guard);
 
@@ -397,6 +474,88 @@ where
                     guard.defer_destroy(raw_shared);
                 }
             }
+        }
+    }
+}
+
+pub struct HashMapRef<'a, K, V, S> {
+    guard: GuardRef<'a>,
+    map: &'a HashMap<K, V, S>,
+}
+
+impl<K, V, S> HashMapRef<'_, K, V, S>
+where
+    K: Eq + Hash + 'static + Send + Sync,
+    V: 'static + Send + Sync,
+    S: BuildHasher,
+{
+    #[inline]
+    pub fn insert(&self, key: K, val: V) -> Option<&V> {
+        self.map.insert_unchecked(key, val, &self.guard)
+    }
+
+    #[inline]
+    pub fn try_insert(&self, key: K, val: V) -> Result<(), V> {
+        self.map.try_insert(key, val, &self.guard)
+    }
+
+    #[inline]
+    pub fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + Hash + Eq,
+    {
+        self.map.get_unchecked(key, &self.guard)
+    }
+
+    #[inline]
+    pub fn get_key_value<Q>(&self, key: &Q) -> Option<(&K, &V)>
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + Hash + Eq,
+    {
+        self.map.get_key_value_unchecked(key, &self.guard)
+    }
+
+    #[inline]
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + Hash + Eq,
+    {
+        self.map.contains_key_unchecked(key, &self.guard)
+    }
+
+    #[inline]
+    pub fn remove_entry<Q>(&self, key: &Q) -> Option<(&K, &V)>
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + Hash + Eq,
+    {
+        self.map.remove_entry_unchecked(key, &self.guard)
+    }
+
+    #[inline]
+    pub fn remove<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + Hash + Eq,
+    {
+        self.map.remove_unchecked(key, &self.guard)
+    }
+}
+
+enum GuardRef<'g> {
+    Owned(Guard),
+    Ref(&'g Guard),
+}
+
+impl<'g> std::ops::Deref for GuardRef<'g> {
+    type Target = Guard;
+
+    fn deref(&self) -> &Self::Target {
+        match *self {
+            GuardRef::Owned(ref guard) | GuardRef::Ref(&ref guard) => guard,
         }
     }
 }

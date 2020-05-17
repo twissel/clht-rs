@@ -11,4 +11,6 @@ mod map;
 
 pub type DefaultHashBuilder = ahash::RandomState;
 
-pub use crate::map::HashMap;
+pub use crate::map::{HashMap, HashMapRef};
+
+pub use crossbeam::epoch::{pin, Guard};
