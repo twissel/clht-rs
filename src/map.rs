@@ -301,6 +301,7 @@ where
         self.get_key_value_unchecked(key, guard)
     }
 
+    #[inline]
     fn get_key_value_unchecked<'g, Q>(&'g self, key: &Q, guard: &'g Guard) -> Option<(&'g K, &'g V)>
     where
         K: Borrow<Q>,
@@ -508,7 +509,7 @@ where
         self.map.get_unchecked(key, &self.guard)
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn get_key_value<Q>(&self, key: &Q) -> Option<(&K, &V)>
     where
         K: Borrow<Q>,

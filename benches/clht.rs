@@ -8,7 +8,7 @@ use std::sync::Arc;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const ITER: u64 = 24 * 1024;
+const ITER: u64 = 24 * 1024 * 10;
 
 fn task_insert_u64_u64(threads: usize) -> HashMap<u64, u64> {
     let map = Arc::new(HashMap::new());
@@ -104,7 +104,6 @@ fn insert_u64_u64(c: &mut Criterion) {
 
 fn task_get_u64_u64(threads: usize, map: Arc<HashMap<u64, u64>>) {
     let inc = ITER / (threads as u64);
-
     rayon::scope(|s| {
         for t in 1..=(threads as u64) {
             let m = map.clone();
@@ -144,19 +143,18 @@ fn get_u64_u64_single_thread(c: &mut Criterion) {
 fn get_u64_u64(c: &mut Criterion) {
     let mut group = c.benchmark_group("get_u64_u64");
     group.throughput(Throughput::Elements(ITER as u64));
-    let max = num_cpus::get();
-    for threads in max..=max {
-        let map = Arc::new(task_insert_u64_u64(threads));
 
+    for threads in &[1, 4, 8, 12, 24] {
+        let map = Arc::new(task_insert_u64_u64(*threads));
         group.bench_with_input(
             BenchmarkId::from_parameter(threads),
             &threads,
             |b, &threads| {
                 let pool = rayon::ThreadPoolBuilder::new()
-                    .num_threads(threads)
+                    .num_threads(*threads)
                     .build()
                     .unwrap();
-                pool.install(|| b.iter(|| task_get_u64_u64(threads, map.clone())));
+                pool.install(|| b.iter(|| task_get_u64_u64(*threads, map.clone())));
             },
         );
     }
@@ -166,8 +164,8 @@ fn get_u64_u64(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    //get_u64_u64_single_thread,
-    //insert_u64_u64,
+    get_u64_u64_single_thread,
+    insert_u64_u64,
     get_u64_u64
 );
 criterion_main!(benches);
