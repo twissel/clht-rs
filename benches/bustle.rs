@@ -110,11 +110,11 @@ impl CollectionHandle for FlurryTableHandle {
 fn main() {
     tracing_subscriber::fmt::init();
     println!("\r\nrunning clht read heavy benchmark");
-    for n in 1..=1 {
+    for n in 1..=num_cpus::get() {
         Workload::new(n, Mix::read_heavy()).run::<CLHTTable>();
     }
 
-    /*println!("\r\nrunning flurry read heavy benchmark");
+    println!("\r\nrunning flurry read heavy benchmark");
     for n in 1..=num_cpus::get() {
         Workload::new(n, Mix::read_heavy()).run::<FlurryTable>();
     }
@@ -147,5 +147,5 @@ fn main() {
     println!("\r\nrunning flurry uniform benchmark");
     for n in 1..=num_cpus::get() {
         Workload::new(n, Mix::uniform()).run::<FlurryTable>();
-    }*/
+    }
 }
