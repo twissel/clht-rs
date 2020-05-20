@@ -24,19 +24,27 @@ pub struct Shared_;
 
 #[derive(Clone, Copy)]
 pub struct EntryRef<'g, K, V, M> {
-    cell: &'g Atomic<(K, V)>,
-    signature: &'g AtomicU8,
+    bucket: &'g Bucket<K, V>,
+    bucket_pos: usize,
     _mut_mark: PhantomData<M>,
     guard: &'g Guard,
 }
 
 impl<'g, K, V, M> EntryRef<'g, K, V, M> {
     fn load_signature(&self) -> u8 {
-        self.signature.load(Acquire)
+        self.signature().load(Acquire)
     }
 
     fn load_key_value(&self) -> Shared<'g, (K, V)> {
-        self.cell.load(Acquire, self.guard)
+        self.cell().load(Acquire, self.guard)
+    }
+
+    fn cell(&self) -> &Atomic<(K, V)> {
+        unsafe { self.bucket.cells.get_unchecked(self.bucket_pos) }
+    }
+
+    fn signature(&self) -> &AtomicU8 {
+        unsafe { self.bucket.signatures.get_unchecked(self.bucket_pos) }
     }
 }
 
@@ -44,71 +52,27 @@ impl<'g, K, V> EntryRef<'g, K, V, Mut_> {
     fn store(&self, pair: Pair<K, V>) {
         match pair {
             Pair::Owned { pair, sign } => {
-                self.cell.store(Owned::new(pair), Release);
-                self.signature.store(sign, Release);
+                self.cell().store(Owned::new(pair), Release);
+                self.signature().store(sign, Release);
             }
             Pair::Shared { sign, pair } => {
-                self.cell.store(pair, Release);
-                self.signature.store(sign, Release);
+                self.cell().store(pair, Release);
+                self.signature().store(sign, Release);
             }
         };
     }
 
     fn clear(&self) {
-        self.cell.store(Shared::null(), Release);
-        self.signature.store(0, Release);
+        self.cell().store(Shared::null(), Release);
+        self.signature().store(0, Release);
     }
 
     pub fn swap_with_null(&self) -> Shared<'g, (K, V)> {
-        let old = self.cell.swap(Shared::null(), Release, self.guard);
-        self.signature.store(0, Release);
+        let old = self.cell().swap(Shared::null(), Release, self.guard);
+        self.signature().store(0, Release);
         old
     }
 }
-
-/*
-pub struct EntryRefIter<'g, K, V, M> {
-    bucket: &'g Bucket<K, V>,
-    curr_entry_idx: usize,
-    guard: &'g Guard,
-    mut_mark: PhantomData<M>,
-}
-
-impl<'g, K, V, M> Iterator for EntryRefIter<'g, K, V, M>
-where
-    M: Copy,
-{
-    type Item = EntryRef<'g, K, V, M>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let len = self.bucket.cells.len();
-            if self.curr_entry_idx < len {
-                let entry = Some(EntryRef {
-                    bucket: self.bucket,
-                    bucket_pos: self.curr_entry_idx,
-                    _mut_mark: PhantomData,
-                    guard: self.guard,
-                });
-                self.curr_entry_idx += 1;
-                return entry;
-            } else {
-                let next_bucket = self.bucket.next.load(Acquire, self.guard);
-                let next_bucket_ref = unsafe { next_bucket.as_ref() };
-                match next_bucket_ref {
-                    Some(next) => {
-                        self.curr_entry_idx = 0;
-                        self.bucket = next;
-                        continue;
-                    }
-                    None => {
-                        return None;
-                    }
-                }
-            }
-        }
-    }
-}*/
 
 #[repr(align(64))]
 pub struct Bucket<K, V> {
@@ -172,18 +136,14 @@ where
 
             fn next(&mut self) -> Option<Self::Item> {
                 if self.curr < ENTRIES_PER_BUCKET {
-                    unsafe {
-                        let cell = self.bucket.cells.get_unchecked(self.curr);
-                        let signature = self.bucket.signatures.get_unchecked(self.curr);
-                        let entry_ref = Some(EntryRef {
-                            cell,
-                            signature,
-                            _mut_mark: PhantomData,
-                            guard: self.guard,
-                        });
-                        self.curr += 1;
-                        entry_ref
-                    }
+                    let entry_ref = Some(EntryRef {
+                        bucket: self.bucket,
+                        bucket_pos: self.curr,
+                        _mut_mark: PhantomData,
+                        guard: self.guard,
+                    });
+                    self.curr += 1;
+                    entry_ref
                 } else {
                     None
                 }
