@@ -10,6 +10,115 @@ use std::sync::atomic::{
 
 pub const ENTRIES_PER_BUCKET: usize = 5;
 
+pub struct Node<K, V> {
+    signatures: [AtomicU8; ENTRIES_PER_BUCKET],
+    cells: [Atomic<(K, V)>; ENTRIES_PER_BUCKET],
+    next: Atomic<Node<K, V>>,
+}
+
+impl<K, V> Node<K, V> {
+    pub fn new() -> Self {
+        Self {
+            cells: [
+                Atomic::null(),
+                Atomic::null(),
+                Atomic::null(),
+                Atomic::null(),
+                Atomic::null(),
+            ],
+            signatures: [
+                AtomicU8::new(0),
+                AtomicU8::new(0),
+                AtomicU8::new(0),
+                AtomicU8::new(0),
+                AtomicU8::new(0),
+            ],
+            next: Atomic::null(),
+        }
+    }
+
+    #[inline]
+    pub fn iter<'g>(&'g self, guard: &'g Guard) -> impl Iterator<Item = EntryRef<'g, K, V>> + 'g {
+        struct EntryRefIter<'g, K, V> {
+            curr: usize,
+            entries: &'g Node<K, V>,
+            guard: &'g Guard,
+        }
+
+        impl<'g, K, V> Iterator for EntryRefIter<'g, K, V> {
+            type Item = EntryRef<'g, K, V>;
+
+            #[inline]
+            fn next(&mut self) -> Option<Self::Item> {
+                if self.curr < ENTRIES_PER_BUCKET {
+                    unsafe {
+                        let cell = self.entries.cells.get_unchecked(self.curr);
+                        let signature = self.entries.signatures.get_unchecked(self.curr);
+                        let entry_ref = Some(EntryRef {
+                            cell,
+                            signature,
+                            guard: self.guard,
+                        });
+                        self.curr += 1;
+                        entry_ref
+                    }
+                } else {
+                    None
+                }
+            }
+        }
+
+        EntryRefIter {
+            curr: 0,
+            entries: self,
+            guard,
+        }
+
+        // TODO: somehow this is twice slower than handwritten version, investigate why
+        /*self.cells
+        .iter()
+        .zip(&self.signatures)
+        .map(move |(cell, signature)| EntryRef {
+            cell,
+            signature,
+            guard,
+            _mut_mark: PhantomData,
+        })*/
+    }
+
+    fn clean(&mut self) {
+        unsafe {
+            for cell in &self.cells {
+                let pair = cell.load(Acquire, unprotected());
+                if pair.as_ref().is_some() {
+                    let _ = pair.into_owned();
+                }
+            }
+        }
+    }
+}
+
+pub struct NodeIter<'g, K, V> {
+    current: Option<&'g Node<K, V>>,
+    guard: &'g Guard,
+}
+
+impl<'g, K, V> Iterator for NodeIter<'g, K, V> {
+    type Item = &'g Node<K, V>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.current {
+            Some(current) => {
+                let next = current.next.load(Acquire, self.guard);
+                self.current = unsafe { next.as_ref() };
+                Some(current)
+            }
+            None => None,
+        }
+    }
+}
+
 pub enum Pair<'g, K, V> {
     Shared { pair: Shared<'g, (K, V)>, sign: u8 },
     Owned { pair: (K, V), sign: u8 },
@@ -59,46 +168,22 @@ impl<'g, K, V> EntryRef<'g, K, V> {
 #[repr(align(64))]
 pub struct Bucket<K, V> {
     lock: Mutex<()>,
-    signatures: [AtomicU8; ENTRIES_PER_BUCKET],
-    cells: [Atomic<(K, V)>; ENTRIES_PER_BUCKET],
-    next: Atomic<Bucket<K, V>>,
+    head: Node<K, V>,
 }
 
 impl<K, V> Bucket<K, V> {
     pub fn new() -> Self {
         Self {
             lock: Mutex::new(()),
-            cells: [
-                Atomic::null(),
-                Atomic::null(),
-                Atomic::null(),
-                Atomic::null(),
-                Atomic::null(),
-            ],
-            signatures: [
-                AtomicU8::new(0),
-                AtomicU8::new(0),
-                AtomicU8::new(0),
-                AtomicU8::new(0),
-                AtomicU8::new(0),
-            ],
-            next: Atomic::null(),
+            head: Node::new(),
         }
     }
-}
 
-impl<K, V> Bucket<K, V>
-where
-    K: 'static,
-    V: 'static,
-{
-    #[inline]
-    pub fn entries_with_overflow<'g>(
-        &'g self,
-        guard: &'g Guard,
-    ) -> impl Iterator<Item = EntryRef<'g, K, V>> + 'g {
-        self.iter(guard)
-            .flat_map(move |bucket| bucket.entries(guard))
+    pub fn node_iter<'g>(&'g self, guard: &'g Guard) -> NodeIter<'g, K, V> {
+        NodeIter {
+            current: Some(&self.head),
+            guard,
+        }
     }
 
     #[inline]
@@ -106,50 +191,7 @@ where
         &'g self,
         guard: &'g Guard,
     ) -> impl Iterator<Item = EntryRef<'g, K, V>> + 'g {
-        struct EntryRefIter<'g, K, V> {
-            curr: usize,
-            bucket: &'g Bucket<K, V>,
-            guard: &'g Guard,
-        }
-
-        impl<'g, K, V> Iterator for EntryRefIter<'g, K, V> {
-            type Item = EntryRef<'g, K, V>;
-
-            fn next(&mut self) -> Option<Self::Item> {
-                if self.curr < ENTRIES_PER_BUCKET {
-                    unsafe {
-                        let cell = self.bucket.cells.get_unchecked(self.curr);
-                        let signature = self.bucket.signatures.get_unchecked(self.curr);
-                        let entry_ref = Some(EntryRef {
-                            cell,
-                            signature,
-                            guard: self.guard,
-                        });
-                        self.curr += 1;
-                        entry_ref
-                    }
-                } else {
-                    None
-                }
-            }
-        }
-
-        EntryRefIter {
-            curr: 0,
-            bucket: self,
-            guard,
-        }
-
-        // TODO: somehow this is twice slower than handwritten version, investigate why
-        /*self.cells
-        .iter()
-        .zip(&self.signatures)
-        .map(move |(cell, signature)| EntryRef {
-            cell,
-            signature,
-            guard,
-            _mut_mark: PhantomData,
-        })*/
+        self.node_iter(guard).flat_map(move |node| node.iter(guard))
     }
 
     pub fn find<'g, Q>(&'g self, key: &Q, signature: u8, guard: &'g Guard) -> Option<(&'g K, &'g V)>
@@ -157,43 +199,51 @@ where
         Q: ?Sized + Hash + Eq,
         K: Borrow<Q>,
     {
-        self.entries_with_overflow(guard)
-            .find_map(|entry: EntryRef<'g, K, V>| {
-                let cell_signature = entry.load_signature();
-                if cell_signature == signature {
-                    let cell = entry.load_key_value();
-                    let cell_ref = unsafe { cell.as_ref() };
-                    match cell_ref {
-                        Some(cell_ref) => {
-                            if key == cell_ref.0.borrow() {
-                                Some((&cell_ref.0, &cell_ref.1))
-                            } else {
-                                None
-                            }
+        self.entries(guard).find_map(|entry: EntryRef<'g, K, V>| {
+            let cell_signature = entry.load_signature();
+            if cell_signature == signature {
+                let cell = entry.load_key_value();
+                let cell_ref = unsafe { cell.as_ref() };
+                match cell_ref {
+                    Some(cell_ref) => {
+                        if key == cell_ref.0.borrow() {
+                            Some((&cell_ref.0, &cell_ref.1))
+                        } else {
+                            None
                         }
-                        None => None,
                     }
-                } else {
-                    None
+                    None => None,
                 }
-            })
+            } else {
+                None
+            }
+        })
     }
 
-    pub fn write<'g>(&'g self, guard: &'g Guard) -> WriteGuard<'g, K, V> {
-        let lock_guard = self.lock.lock();
-        WriteGuard {
-            _lock_guard: lock_guard,
-            bucket: self,
-            guard,
+    pub fn stats(&self, guard: &Guard) -> Stats {
+        let mut stats = Stats {
+            num_overflows: 0,
+            num_non_empty: 0,
+        };
+        for node in self.node_iter(guard) {
+            stats.num_overflows += 1;
+            for entry_ref in node.iter(guard) {
+                let pair = entry_ref.load_key_value();
+                if !pair.is_null() {
+                    stats.num_non_empty += 1;
+                }
+            }
         }
+        stats.num_overflows -= 1;
+        stats
     }
 
     pub fn transfer(&mut self, pair: Shared<(K, V)>, sign: u8) -> bool {
-        let mut last_bucket = &*self;
+        let mut last_node = &self.head;
         let guard = unsafe { unprotected() };
-        for bucket in self.iter(guard) {
-            last_bucket = bucket;
-            for entry_ref in bucket.entries(guard) {
+        for node in self.node_iter(guard) {
+            last_node = node;
+            for entry_ref in node.iter(guard) {
                 let cell = entry_ref.load_key_value();
                 let cell_ref = unsafe { cell.as_ref() };
 
@@ -207,55 +257,21 @@ where
             }
         }
 
-        let new_bucket = Bucket::new();
-        let entry_ref = new_bucket.entries(guard).next().unwrap();
+        let new_node = Node::new();
+        let entry_ref = new_node.iter(guard).next().unwrap();
         entry_ref.store(Pair::Shared { pair, sign });
-        last_bucket.next.store(Owned::new(new_bucket), Release);
+        last_node.next.store(Owned::new(new_node), Release);
         true
     }
+}
 
-    pub fn stats(&self, guard: &Guard) -> Stats {
-        let mut stats = Stats {
-            num_overflows: 0,
-            num_non_empty: 0,
-        };
-        for bucket in self.iter(guard) {
-            stats.num_overflows += 1;
-            for entry_ref in bucket.entries(guard) {
-                let pair = entry_ref.load_key_value();
-                if !pair.is_null() {
-                    stats.num_non_empty += 1;
-                }
-            }
-        }
-        stats.num_overflows -= 1;
-        stats
-    }
-
-    pub fn iter<'g>(&'g self, guard: &'g Guard) -> BucketIter<'g, K, V> {
-        BucketIter {
-            current: Some(self),
+impl<K, V> Bucket<K, V> {
+    pub fn write<'g>(&'g self, guard: &'g Guard) -> WriteGuard<'g, K, V> {
+        let lock_guard = self.lock.lock();
+        WriteGuard {
+            _lock_guard: lock_guard,
+            bucket: self,
             guard,
-        }
-    }
-}
-
-pub struct BucketIter<'g, K, V> {
-    current: Option<&'g Bucket<K, V>>,
-    guard: &'g Guard,
-}
-
-impl<'g, K, V> Iterator for BucketIter<'g, K, V> {
-    type Item = &'g Bucket<K, V>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.current {
-            Some(current) => {
-                let next = current.next.load(Acquire, self.guard);
-                self.current = unsafe { next.as_ref() };
-                Some(current)
-            }
-            None => None,
         }
     }
 }
@@ -282,26 +298,15 @@ impl AddAssign for Stats {
     }
 }
 
-impl<K, V> Bucket<K, V> {
-    fn clean_cells(&mut self) {
-        unsafe {
-            for cell in &self.cells {
-                let pair = cell.load(Acquire, unprotected());
-                if pair.as_ref().is_some() {
-                    let _ = pair.into_owned();
-                }
-            }
-        }
-    }
-}
-
 impl<K, V> Drop for Bucket<K, V> {
     fn drop(&mut self) {
+        self.head.clean();
         unsafe {
-            self.clean_cells();
-            let next = self.next.load(Acquire, unprotected());
-            if next.as_ref().is_some() {
-                let _ = next.into_owned();
+            let mut curr = self.head.next.load(Acquire, unprotected());
+            while let Some(_) = curr.as_ref() {
+                let mut owned = curr.into_owned();
+                owned.clean();
+                curr = owned.next.load(Acquire, unprotected());
             }
         }
     }
@@ -320,10 +325,10 @@ where
 {
     pub fn insert(&self, pair: (K, V), pair_sign: u8) -> InsertResult<'g, K, V> {
         let mut empty_entry = None;
-        let mut last_bucket = self.bucket;
-        for bucket in self.bucket.iter(self.guard) {
-            last_bucket = bucket;
-            for entry_ref in bucket.entries(self.guard) {
+        let mut last_node = &self.bucket.head;
+        for node in self.bucket.node_iter(self.guard) {
+            last_node = node;
+            for entry_ref in node.iter(self.guard) {
                 let cell = entry_ref.load_key_value();
                 let cell_ref = unsafe { cell.as_ref() };
                 match cell_ref {
@@ -355,14 +360,14 @@ where
                 InsertResult::Inserted(None)
             }
             None => {
-                let new_bucket = Bucket::new();
-                let entry = new_bucket.entries(self.guard).next().unwrap();
+                let new_node = Node::new();
+                let entry = new_node.iter(self.guard).next().unwrap();
 
                 entry.store(Pair::Owned {
                     pair,
                     sign: pair_sign,
                 });
-                last_bucket.next.store(Owned::new(new_bucket), Release);
+                last_node.next.store(Owned::new(new_node), Release);
                 InsertResult::InsertedWithOverflow
             }
         }
@@ -373,7 +378,7 @@ where
         Q: ?Sized + Hash + Eq,
         K: Borrow<Q>,
     {
-        for entry in self.entries_mut() {
+        for entry in self.entries() {
             let cell = entry.load_key_value();
             let cell_ref = unsafe { cell.as_ref() };
 
@@ -396,10 +401,6 @@ where
         None
     }
 
-    pub fn entries_mut(&self) -> impl Iterator<Item = EntryRef<'g, K, V>> {
-        self.bucket.entries_with_overflow(self.guard)
-    }
-
     pub fn stats(&self, guard: &Guard) -> Stats {
         self.bucket.stats(guard)
     }
@@ -410,6 +411,10 @@ where
         K: Borrow<Q>,
     {
         self.bucket.find(key, signature, &self.guard)
+    }
+
+    pub fn entries(&self) -> impl Iterator<Item = EntryRef<'g, K, V>> {
+        self.bucket.entries(&self.guard)
     }
 }
 
@@ -484,5 +489,10 @@ mod tests {
         for pair in pairs.iter() {
             assert_eq!(bucket.find(&pair.0, 0, &guard), Some((&pair.0, &pair.1)));
         }
+    }
+
+    #[test]
+    fn temp() {
+        dbg!(std::mem::size_of::<Node<u64, u64>>());
     }
 }

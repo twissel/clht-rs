@@ -64,7 +64,7 @@ where
     }
 
     fn transfer_bucket<S: BuildHasher>(&mut self, build_hasher: &S, bucket: &WriteGuard<K, V>) {
-        for entry in bucket.entries_mut() {
+        for entry in bucket.entries() {
             let pair_opt = entry.swap_with_null();
             unsafe {
                 if let Some(pair) = pair_opt.as_ref() {
