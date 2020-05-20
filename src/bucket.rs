@@ -2,7 +2,6 @@ use crossbeam::epoch::*;
 use parking_lot::{Mutex, MutexGuard};
 use std::borrow::Borrow;
 use std::hash::Hash;
-use std::marker::PhantomData;
 use std::ops::AddAssign;
 use std::sync::atomic::{
     AtomicU8,
@@ -17,20 +16,13 @@ pub enum Pair<'g, K, V> {
 }
 
 #[derive(Clone, Copy)]
-pub struct Mut_;
-
-#[derive(Clone, Copy)]
-pub struct Shared_;
-
-#[derive(Clone, Copy)]
-pub struct EntryRef<'g, K, V, M> {
+pub struct EntryRef<'g, K, V> {
     cell: &'g Atomic<(K, V)>,
     signature: &'g AtomicU8,
-    _mut_mark: PhantomData<M>,
     guard: &'g Guard,
 }
 
-impl<'g, K, V, M> EntryRef<'g, K, V, M> {
+impl<'g, K, V> EntryRef<'g, K, V> {
     fn load_signature(&self) -> u8 {
         self.signature.load(Acquire)
     }
@@ -38,9 +30,7 @@ impl<'g, K, V, M> EntryRef<'g, K, V, M> {
     fn load_key_value(&self) -> Shared<'g, (K, V)> {
         self.cell.load(Acquire, self.guard)
     }
-}
 
-impl<'g, K, V> EntryRef<'g, K, V, Mut_> {
     fn store(&self, pair: Pair<K, V>) {
         match pair {
             Pair::Owned { pair, sign } => {
@@ -65,50 +55,6 @@ impl<'g, K, V> EntryRef<'g, K, V, Mut_> {
         old
     }
 }
-
-/*
-pub struct EntryRefIter<'g, K, V, M> {
-    bucket: &'g Bucket<K, V>,
-    curr_entry_idx: usize,
-    guard: &'g Guard,
-    mut_mark: PhantomData<M>,
-}
-
-impl<'g, K, V, M> Iterator for EntryRefIter<'g, K, V, M>
-where
-    M: Copy,
-{
-    type Item = EntryRef<'g, K, V, M>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let len = self.bucket.cells.len();
-            if self.curr_entry_idx < len {
-                let entry = Some(EntryRef {
-                    bucket: self.bucket,
-                    bucket_pos: self.curr_entry_idx,
-                    _mut_mark: PhantomData,
-                    guard: self.guard,
-                });
-                self.curr_entry_idx += 1;
-                return entry;
-            } else {
-                let next_bucket = self.bucket.next.load(Acquire, self.guard);
-                let next_bucket_ref = unsafe { next_bucket.as_ref() };
-                match next_bucket_ref {
-                    Some(next) => {
-                        self.curr_entry_idx = 0;
-                        self.bucket = next;
-                        continue;
-                    }
-                    None => {
-                        return None;
-                    }
-                }
-            }
-        }
-    }
-}*/
 
 #[repr(align(64))]
 pub struct Bucket<K, V> {
@@ -147,28 +93,27 @@ where
     V: 'static,
 {
     #[inline]
-    pub fn entries_with_overflow<'g, M: 'static>(
+    pub fn entries_with_overflow<'g>(
         &'g self,
         guard: &'g Guard,
-    ) -> impl Iterator<Item = EntryRef<'g, K, V, M>> + 'g {
+    ) -> impl Iterator<Item = EntryRef<'g, K, V>> + 'g {
         self.iter(guard)
             .flat_map(move |bucket| bucket.entries(guard))
     }
 
     #[inline]
-    pub fn entries<'g, M: 'static>(
+    pub fn entries<'g>(
         &'g self,
         guard: &'g Guard,
-    ) -> impl Iterator<Item = EntryRef<'g, K, V, M>> + 'g {
-        struct EntryRefIter<'g, K, V, M> {
+    ) -> impl Iterator<Item = EntryRef<'g, K, V>> + 'g {
+        struct EntryRefIter<'g, K, V> {
             curr: usize,
             bucket: &'g Bucket<K, V>,
-            mark: PhantomData<M>,
             guard: &'g Guard,
         }
 
-        impl<'g, K, V, M> Iterator for EntryRefIter<'g, K, V, M> {
-            type Item = EntryRef<'g, K, V, M>;
+        impl<'g, K, V> Iterator for EntryRefIter<'g, K, V> {
+            type Item = EntryRef<'g, K, V>;
 
             fn next(&mut self) -> Option<Self::Item> {
                 if self.curr < ENTRIES_PER_BUCKET {
@@ -178,7 +123,6 @@ where
                         let entry_ref = Some(EntryRef {
                             cell,
                             signature,
-                            _mut_mark: PhantomData,
                             guard: self.guard,
                         });
                         self.curr += 1;
@@ -193,7 +137,6 @@ where
         EntryRefIter {
             curr: 0,
             bucket: self,
-            mark: PhantomData,
             guard,
         }
 
@@ -215,7 +158,7 @@ where
         K: Borrow<Q>,
     {
         self.entries_with_overflow(guard)
-            .find_map(|entry: EntryRef<'g, K, V, Shared_>| {
+            .find_map(|entry: EntryRef<'g, K, V>| {
                 let cell_signature = entry.load_signature();
                 if cell_signature == signature {
                     let cell = entry.load_key_value();
@@ -265,7 +208,7 @@ where
         }
 
         let new_bucket = Bucket::new();
-        let entry_ref = new_bucket.entries::<Mut_>(guard).next().unwrap();
+        let entry_ref = new_bucket.entries(guard).next().unwrap();
         entry_ref.store(Pair::Shared { pair, sign });
         last_bucket.next.store(Owned::new(new_bucket), Release);
         true
@@ -278,7 +221,7 @@ where
         };
         for bucket in self.iter(guard) {
             stats.num_overflows += 1;
-            for entry_ref in bucket.entries::<Shared_>(guard) {
+            for entry_ref in bucket.entries(guard) {
                 let pair = entry_ref.load_key_value();
                 if !pair.is_null() {
                     stats.num_non_empty += 1;
@@ -380,7 +323,7 @@ where
         let mut last_bucket = self.bucket;
         for bucket in self.bucket.iter(self.guard) {
             last_bucket = bucket;
-            for entry_ref in bucket.entries::<Mut_>(self.guard) {
+            for entry_ref in bucket.entries(self.guard) {
                 let cell = entry_ref.load_key_value();
                 let cell_ref = unsafe { cell.as_ref() };
                 match cell_ref {
@@ -413,7 +356,7 @@ where
             }
             None => {
                 let new_bucket = Bucket::new();
-                let entry = new_bucket.entries::<Mut_>(self.guard).next().unwrap();
+                let entry = new_bucket.entries(self.guard).next().unwrap();
 
                 entry.store(Pair::Owned {
                     pair,
@@ -453,7 +396,7 @@ where
         None
     }
 
-    pub fn entries_mut(&self) -> impl Iterator<Item = EntryRef<'g, K, V, Mut_>> {
+    pub fn entries_mut(&self) -> impl Iterator<Item = EntryRef<'g, K, V>> {
         self.bucket.entries_with_overflow(self.guard)
     }
 

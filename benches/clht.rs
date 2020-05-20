@@ -144,7 +144,7 @@ fn get_u64_u64(c: &mut Criterion) {
     let mut group = c.benchmark_group("get_u64_u64");
     group.throughput(Throughput::Elements(ITER as u64));
 
-    for threads in &[1, 4, 8, 12, 24] {
+    for threads in &[24] {
         let map = Arc::new(task_insert_u64_u64(*threads));
         group.bench_with_input(
             BenchmarkId::from_parameter(threads),
@@ -164,8 +164,8 @@ fn get_u64_u64(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    get_u64_u64_single_thread,
-    insert_u64_u64,
+    //get_u64_u64_single_thread,
+    //insert_u64_u64,
     get_u64_u64
 );
 criterion_main!(benches);
