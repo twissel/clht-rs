@@ -320,8 +320,7 @@ pub struct WriteGuard<'g, K, V> {
 
 impl<'g, K, V> WriteGuard<'g, K, V>
 where
-    K: Eq + 'static,
-    V: 'static,
+    K: Eq
 {
     pub fn insert(&self, pair: (K, V), pair_sign: u8) -> InsertResult<'g, K, V> {
         let mut empty_entry = None;
